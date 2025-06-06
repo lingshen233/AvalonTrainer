@@ -67,7 +67,7 @@ echo "   GPU数量: $NUM_GPUS"
 echo "   预设配置: $PRESET"
 echo "   配置文件: $CONFIG_FILE"
 echo "   通信端口: $MASTER_PORT"
-
+ 
 # 检查DeepSpeed安装
 if ! python -c "import deepspeed" 2>/dev/null; then
     echo "❌ DeepSpeed未安装，正在安装..."
