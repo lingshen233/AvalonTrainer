@@ -32,22 +32,28 @@ pip install -r requirements.txt
 
 ## 🎯 快速开始
 
-### 1. 查看可用模型
+### 1. 环境检查
+```bash
+# 快速验证环境和依赖
+python quick_test.py
+```
+
+### 2. 查看可用模型
 ```bash
 python train.py --list_models
 ```
 
-### 2. 测试GPU设置
+### 3. 测试GPU设置
 ```bash
 python test_multi_gpu.py
 ```
 
-### 3. 验证配置
+### 4. 验证配置
 ```bash
 python train.py --dry_run
 ```
 
-### 4. 开始训练
+### 5. 开始训练
 
 **单GPU训练（默认）：**
 ```bash
@@ -68,6 +74,18 @@ python train.py --model_type transformer --num_gpus 2
 ```bash
 # 修改config.yaml中 system.auto_shutdown: true
 python train.py
+```
+
+### 6. 基准测试
+```bash
+# 下载标准数据集和预训练模型进行测试
+python test_benchmark.py
+
+# 仅下载数据集
+python test_benchmark.py --datasets-only
+
+# 仅下载预训练模型
+python test_benchmark.py --models-only
 ```
 
 ## 📊 模型对比
@@ -185,9 +203,10 @@ model.eval()
 RAG Transformer/
 ├── train.py                    # 主训练脚本
 ├── test_multi_gpu.py           # GPU测试工具
+├── quick_test.py               # 快速环境测试
+├── test_benchmark.py           # 基准测试脚本
 ├── config.yaml                 # 默认配置
 ├── config_transformer_4gpu.yaml # 多GPU示例配置
-├── MODEL_FILES.md              # 模型文件说明文档
 ├── requirements.txt            # 依赖包列表
 ├── configs/                    # 配置系统
 │   ├── base.py                 # 基础配置类
@@ -198,9 +217,13 @@ RAG Transformer/
 │   ├── mamba.py                # Mamba模型
 │   └── registry.py             # 模型注册
 ├── trainers/                   # 训练器
-│   └── base.py                 # 基础训练器
-└── data/                       # 数据处理
-    └── processor.py            # 数据处理器
+│   ├── base.py                 # 基础训练器
+│   └── multi_gpu.py            # 多GPU训练器
+├── data/                       # 数据处理
+│   └── processor.py            # 数据处理器
+├── utils/                      # 工具函数
+│   └── logging.py              # 日志工具
+└── test_results/               # 测试结果目录（自动创建）
 ```
 
 ## 📈 性能优化

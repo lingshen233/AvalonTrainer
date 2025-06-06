@@ -58,17 +58,18 @@ def auto_shutdown(delay_seconds: int = 60):
         in_docker = is_docker_container()
         is_root = is_root_user()
         
-        if in_docker:
-            print("🐳 检测到Docker容器环境")
-            # 在Docker容器中，通常只能停止容器，不能关机
-            print("💡 容器环境无法直接关机，建议手动停止容器")
-            print("   可以使用: docker stop <container_id>")
-            return
-        
         if system == "windows":
             subprocess.run(["shutdown", "/s", "/t", "0"])
         elif system in ["linux", "darwin"]:  # Linux或macOS
-            if is_root:
+            if in_docker:
+                print("🐳 Docker容器环境，执行容器关机...")
+                # 在Docker容器中，直接使用shutdown或halt
+                try:
+                    subprocess.run(["shutdown", "-h", "now"])
+                except FileNotFoundError:
+                    # 如果shutdown不可用，尝试halt
+                    subprocess.run(["halt"])
+            elif is_root:
                 # root用户直接使用shutdown
                 subprocess.run(["shutdown", "-h", "now"])
             else:
@@ -83,7 +84,8 @@ def auto_shutdown(delay_seconds: int = 60):
         print(f"\n❌ 关机命令未找到: {e}")
         print("💡 可能的解决方案:")
         if is_docker_container():
-            print("   - Docker容器环境请手动停止容器")
+            print("   - 尝试使用 'halt' 命令")
+            print("   - 或手动停止容器")
         else:
             print("   - 确保系统支持shutdown命令")
             print("   - 检查用户权限设置")
@@ -273,8 +275,6 @@ def main():
     if auto_shutdown_enabled:
         shutdown_delay = yaml_config.get('system', {}).get('shutdown_delay', 60)
         print(f"🔄 自动关机: 启用 ({shutdown_delay}秒延迟)")
-        if is_docker_container():
-            print(f"⚠️  Docker环境警告: 将显示关机提示但不会实际关机")
     else:
         print(f"🔄 自动关机: 禁用")
     
