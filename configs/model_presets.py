@@ -101,39 +101,6 @@ MODEL_PRESETS = {
         'memory_estimate': '2GB/GPU',
         'recommended_gpus': [1],
         'datasets': ['squad', 'wikitext']
-    },
-    
-    "7b_mamba": {
-        "description": "7B Mamba模型 - 高效状态空间模型",
-        "estimated_params": "7.0B",
-        "memory_per_gpu": "20GB",
-        "recommended_gpus": 4,
-        "model_type": "mamba",
-        "config": {
-            "vocab_size": 50257,
-            "max_seq_length": 4096,
-            "d_model": 4096,
-            "n_layers": 32,
-            "d_state": 16,
-            "d_conv": 4,
-            "expand": 2,
-            "dropout": 0.1
-        },
-        "training": {
-            "batch_size": 2,
-            "gradient_accumulation_steps": 16,
-            "max_length": 4096,
-            "learning_rate": 1e-4,
-            "fp16": True,
-            "gradient_checkpointing": True
-        },
-        "datasets": ["openwebtext", "c4", "bookcorpus"],
-        "notes": [
-            "比7B Transformer显存效率更高",
-            "支持更长序列处理",
-            "线性时间复杂度",
-            "适合长文本生成任务"
-        ]
     }
 }
 
