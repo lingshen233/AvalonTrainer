@@ -1,0 +1,57 @@
+# 7B Transformer模型配置 - 显存优化版
+# 针对4张24GB GPU优化
+
+# 基础设置
+model_type: "transformer"
+num_gpus: 4
+
+# 模型配置 - 保持7B规模但优化显存使用
+model:
+  vocab_size: 50257
+  max_seq_length: 2048    # 减小序列长度以节省显存
+  d_model: 4096
+  n_layers: 32
+  n_heads: 32
+  d_ff: 16384
+  dropout: 0.1
+
+# 训练配置 - 显存优化
+training:
+  dataset: "auto"
+  batch_size: 1                    # 极小批大小，通过梯度累积补偿
+  gradient_accumulation_steps: 32  # 有效批大小 = 1 * 32 = 32
+  eval_batch_size: 1
+  max_length: 2048
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_steps: 100000
+  warmup_steps: 5000
+  eval_steps: 5000
+  save_steps: 10000
+  logging_steps: 100
+  fp16: true                       # 启用混合精度
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  use_wandb: false
+  wandb_project: "rag-transformer"
+  run_name: "7b_transformer_fixed"
+
+# 数据集配置
+datasets:
+  primary: "wikitext"              # 主数据集
+  secondary: ["bookcorpus"]        # 辅助数据集
+  mixing_ratio: [0.7, 0.3]        # 混合比例
+
+# 显存优化设置
+optimization:
+  gradient_checkpointing: true     # 启用梯度检查点
+  cpu_offload: false              # CPU卸载（如果需要）
+  pin_memory: true                # 固定内存
+  num_workers: 4                  # 数据加载器工作进程
+
+# 系统配置
+system:
+  auto_shutdown: true
+  shutdown_delay: 300             # 5分钟延迟
+  save_memory: true               # 节省显存模式 
