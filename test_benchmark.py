@@ -1,221 +1,110 @@
 #!/usr/bin/env python3
 """
-自动化测试脚本
-- 下载基准数据集
-- 下载预训练模型
-- 执行模型测试和评估
+综合基准测试脚本
+下载标准数据集和预训练模型进行全面评估
 """
 
 import os
 import sys
 import argparse
 import torch
-import numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from datasets import load_dataset
-import requests
+import time
 import json
 from pathlib import Path
-import time
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import numpy as np
 
-def download_benchmark_datasets():
+def remove_module_prefix(state_dict):
+    """移除DDP模型的module.前缀"""
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            new_state_dict[k[7:]] = v  # 移除'module.'前缀
+        else:
+            new_state_dict[k] = v
+    return new_state_dict
+
+def download_benchmarks():
     """下载基准测试数据集"""
     print("📥 下载基准数据集...")
+    datasets = {}
     
-    datasets_info = {
-        'wikitext': {
-            'name': 'wikitext',
-            'config': 'wikitext-2-raw-v1',
-            'description': 'WikiText-2 语言建模数据集'
-        },
-        'lambada': {
-            'name': 'lambada',
-            'config': None,
-            'description': 'LAMBADA 阅读理解数据集'
-        },
-        'hellaswag': {
-            'name': 'hellaswag',
-            'config': None,
-            'description': 'HellaSwag 常识推理数据集'
-        }
-    }
+    # WikiText-2 语言建模
+    try:
+        print("  正在下载 WikiText-2 语言建模数据集...")
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        datasets['wikitext'] = dataset
+        print("  ✅ wikitext 下载完成")
+    except Exception as e:
+        print(f"  ❌ wikitext 下载失败: {e}")
     
-    downloaded_datasets = {}
+    # LAMBADA 阅读理解
+    try:
+        print("  正在下载 LAMBADA 阅读理解数据集...")
+        dataset = load_dataset("lambada", split="test")
+        datasets['lambada'] = dataset
+        print("  ✅ lambada 下载完成")
+    except Exception as e:
+        print(f"  ❌ lambada 下载失败: {e}")
     
-    for dataset_key, info in datasets_info.items():
-        try:
-            print(f"  正在下载 {info['description']}...")
-            if info['config']:
-                dataset = load_dataset(info['name'], info['config'])
-            else:
-                dataset = load_dataset(info['name'])
-            
-            downloaded_datasets[dataset_key] = dataset
-            print(f"  ✅ {dataset_key} 下载完成")
-            
-        except Exception as e:
-            print(f"  ❌ {dataset_key} 下载失败: {e}")
-            downloaded_datasets[dataset_key] = None
+    # HellaSwag 常识推理
+    try:
+        print("  正在下载 HellaSwag 常识推理数据集...")
+        dataset = load_dataset("hellaswag", split="validation", trust_remote_code=True)
+        datasets['hellaswag'] = dataset
+        print("  ✅ hellaswag 下载完成")
+    except Exception as e:
+        print(f"  ❌ hellaswag 下载失败: {e}")
     
-    return downloaded_datasets
+    return datasets
 
-def download_pretrained_models():
-    """下载预训练的1B模型"""
+def download_baseline_models():
+    """下载基准对比模型"""
     print("\n🤖 下载预训练模型...")
+    models = {}
     
-    models_info = {
-        'gpt2-xl': {
-            'name': 'gpt2-xl',
-            'description': 'GPT-2 XL (1.5B参数)',
-            'size': '1.5B'
-        },
-        'EleutherAI/gpt-neo-1.3B': {
-            'name': 'EleutherAI/gpt-neo-1.3B',
-            'description': 'GPT-Neo 1.3B (1.3B参数)',
-            'size': '1.3B'
-        },
-        'microsoft/DialoGPT-large': {
-            'name': 'microsoft/DialoGPT-large',
-            'description': 'DialoGPT Large (774M参数)',
-            'size': '774M'
-        },
-        'gpt2-medium': {
-            'name': 'gpt2-medium',
-            'description': 'GPT-2 Medium (355M参数)',
-            'size': '355M'
-        },
-        'distilgpt2': {
-            'name': 'distilgpt2', 
-            'description': 'DistilGPT-2 (82M参数) - 快速测试',
-            'size': '82M'
-        }
-    }
+    baseline_models = [
+        ("gpt2-xl", "GPT-2 XL (1.5B参数)"),
+        ("EleutherAI/gpt-neo-1.3B", "GPT-Neo 1.3B (1.3B参数)"),
+        ("microsoft/DialoGPT-large", "DialoGPT Large (774M参数)"),
+        ("gpt2-medium", "GPT-2 Medium (355M参数)"),
+        ("distilgpt2", "DistilGPT-2 (82M参数) - 快速测试")
+    ]
     
-    downloaded_models = {}
-    
-    for model_key, info in models_info.items():
+    for model_id, description in baseline_models:
         try:
-            print(f"  正在下载 {info['description']}...")
+            print(f"  正在下载 {description}...")
             
-            # 下载tokenizer和模型
-            tokenizer = AutoTokenizer.from_pretrained(info['name'])
-            model = AutoModelForCausalLM.from_pretrained(info['name'])
+            # 尝试加载模型
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id, 
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True
+            )
             
-            downloaded_models[model_key] = {
-                'tokenizer': tokenizer,
+            # 设置pad_token
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            param_count = sum(p.numel() for p in model.parameters())
+            models[model_id] = {
                 'model': model,
-                'info': info
+                'tokenizer': tokenizer,
+                'params': param_count
             }
             
-            print(f"  ✅ {model_key} 下载完成 ({info['size']})")
+            print(f"  ✅ {model_id} 下载完成 ({param_count/1e9:.1f}B)")
             
         except Exception as e:
-            print(f"  ❌ {model_key} 下载失败: {e}")
-            downloaded_models[model_key] = None
+            print(f"  ❌ {model_id} 下载失败: {e}")
     
-    return downloaded_models
+    return models
 
-def evaluate_perplexity(model, tokenizer, dataset, max_samples=100):
-    """计算困惑度"""
-    print("📊 计算困惑度...")
-    
-    model.eval()
-    device = next(model.parameters()).device
-    
-    total_loss = 0
-    total_tokens = 0
-    
-    # 使用测试集的一小部分
-    test_texts = dataset['test']['text'][:max_samples] if 'test' in dataset else dataset['validation']['text'][:max_samples]
-    
-    with torch.no_grad():
-        for i, text in enumerate(test_texts):
-            if len(text.strip()) < 10:  # 跳过太短的文本
-                continue
-                
-            try:
-                # 编码文本
-                inputs = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                
-                # 计算损失
-                outputs = model(**inputs, labels=inputs['input_ids'])
-                loss = outputs.loss
-                
-                total_loss += loss.item() * inputs['input_ids'].size(1)
-                total_tokens += inputs['input_ids'].size(1)
-                
-                if (i + 1) % 10 == 0:
-                    print(f"  已处理 {i+1}/{len(test_texts)} 个样本...")
-                    
-            except Exception as e:
-                print(f"  跳过样本 {i}: {e}")
-                continue
-    
-    if total_tokens > 0:
-        avg_loss = total_loss / total_tokens
-        perplexity = torch.exp(torch.tensor(avg_loss)).item()
-        return perplexity
-    else:
-        return float('inf')
-
-def test_text_generation(model, tokenizer, prompts=None):
-    """测试文本生成"""
-    print("✍️ 测试文本生成...")
-    
-    if prompts is None:
-        prompts = [
-            "人工智能的未来发展",
-            "Once upon a time",
-            "The meaning of life is", 
-            "科技改变了我们的生活"
-        ]
-    
-    model.eval()
-    device = next(model.parameters()).device
-    
-    results = []
-    
-    for prompt in prompts:
-        try:
-            print(f"\n  提示词: '{prompt}'")
-            
-            # 编码输入
-            inputs = tokenizer(prompt, return_tensors='pt').to(device)
-            
-            # 生成文本
-            with torch.no_grad():
-                outputs = model.generate(
-                    inputs['input_ids'],
-                    max_length=inputs['input_ids'].size(1) + 50,
-                    num_return_sequences=1,
-                    temperature=0.8,
-                    do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id
-                )
-            
-            # 解码输出
-            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            generated_text = generated_text[len(prompt):].strip()
-            
-            print(f"  生成: {generated_text}")
-            results.append({
-                'prompt': prompt,
-                'generated': generated_text
-            })
-            
-        except Exception as e:
-            print(f"  ❌ 生成失败: {e}")
-            results.append({
-                'prompt': prompt,
-                'generated': None,
-                'error': str(e)
-            })
-    
-    return results
-
-def test_trained_model(checkpoint_path='checkpoints/final_model.pt'):
-    """测试我们训练的模型"""
+def test_trained_model(checkpoint_path, datasets):
+    """测试训练的模型"""
     print(f"\n🧪 测试训练的模型: {checkpoint_path}")
     
     if not os.path.exists(checkpoint_path):
@@ -223,140 +112,304 @@ def test_trained_model(checkpoint_path='checkpoints/final_model.pt'):
         return None
     
     try:
-        # 导入我们的模型系统
         from models import create_model
         from configs.base import ModelConfig
-        from transformers import AutoTokenizer
         
-        # 加载检查点
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # 加载模型
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         model_config = ModelConfig(**checkpoint['config'])
         
-        # 创建模型
         model = create_model(model_config.model_type, model_config)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 处理DDP模型的state_dict
+        state_dict = checkpoint['model_state_dict']
+        has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
+        if has_module_prefix:
+            print("  🔄 检测到DDP模型，移除module.前缀...")
+            state_dict = remove_module_prefix(state_dict)
+        
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
         
-        # 使用GPT-2的tokenizer（兼容性较好）
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device)
+        
+        # 使用GPT-2 tokenizer（兼容性最好）
         tokenizer = AutoTokenizer.from_pretrained('gpt2')
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
         total_params = sum(p.numel() for p in model.parameters())
         print(f"  ✅ 模型加载成功")
-        print(f"  模型类型: {model_config.model_type}")
-        print(f"  参数量: {total_params:,} ({total_params/1e6:.1f}M)")
+        print(f"     类型: {model_config.model_type}")
+        print(f"     参数量: {total_params:,} ({total_params/1e6:.1f}M)")
+        
+        # 测试困惑度
+        results = {}
+        for dataset_name, dataset in datasets.items():
+            if dataset is None:
+                continue
+                
+            try:
+                print(f"  📊 在{dataset_name}上计算困惑度...")
+                perplexity = calculate_perplexity_trained_model(model, tokenizer, dataset, device)
+                results[dataset_name] = {'perplexity': perplexity}
+                print(f"     {dataset_name} 困惑度: {perplexity:.2f}")
+            except Exception as e:
+                print(f"     ❌ {dataset_name} 测试失败: {e}")
+                results[dataset_name] = {'error': str(e)}
         
         return {
-            'model': model,
-            'tokenizer': tokenizer,
-            'config': model_config,
-            'checkpoint_path': checkpoint_path
+            'model_type': model_config.model_type,
+            'params': total_params,
+            'results': results
         }
         
     except Exception as e:
         print(f"  ❌ 模型加载失败: {e}")
         return None
 
-def run_comprehensive_test():
-    """运行综合测试"""
+def calculate_perplexity_trained_model(model, tokenizer, dataset, device, max_samples=50):
+    """计算训练模型的困惑度"""
+    total_loss = 0
+    total_tokens = 0
+    
+    with torch.no_grad():
+        for i, example in enumerate(dataset):
+            if i >= max_samples:
+                break
+                
+            if i % 10 == 0 and i > 0:
+                print(f"    已处理 {i}/{max_samples} 个样本...")
+            
+            # 获取文本
+            text = example.get('text', '') or example.get('ending', '') or str(example)
+            if not text or len(text.strip()) < 10:
+                continue
+            
+            # Tokenize
+            inputs = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
+            input_ids = inputs['input_ids'].to(device)
+            
+            if input_ids.size(1) < 2:
+                continue
+            
+            # 前向传播
+            outputs = model(input_ids)
+            
+            # 处理不同类型的输出
+            if isinstance(outputs, dict):
+                if 'logits' in outputs:
+                    logits = outputs['logits']
+                else:
+                    # 获取第一个张量输出
+                    tensor_outputs = {k: v for k, v in outputs.items() if torch.is_tensor(v)}
+                    logits = next(iter(tensor_outputs.values()))
+            elif hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs
+            
+            # 计算损失
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous()
+            
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), 
+                           shift_labels.view(-1))
+            
+            total_loss += loss.item()
+            total_tokens += shift_labels.numel()
+    
+    if total_tokens == 0:
+        return float('inf')
+    
+    avg_loss = total_loss / total_tokens
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    return perplexity
+
+def calculate_perplexity(model, tokenizer, dataset, device, max_samples=50):
+    """计算困惑度"""
+    total_loss = 0
+    total_tokens = 0
+    
+    model.eval()
+    with torch.no_grad():
+        for i, example in enumerate(dataset):
+            if i >= max_samples:
+                break
+                
+            if i % 10 == 0 and i > 0:
+                print(f"  已处理 {i}/{max_samples} 个样本...")
+            
+            # 获取文本
+            text = example.get('text', '') or example.get('ending', '') or str(example)
+            if not text or len(text.strip()) < 10:
+                continue
+            
+            # Tokenize
+            try:
+                inputs = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
+                input_ids = inputs['input_ids'].to(device)
+                
+                if input_ids.size(1) < 2:
+                    continue
+                
+                # 前向传播
+                outputs = model(input_ids, labels=input_ids)
+                loss = outputs.loss
+                
+                total_loss += loss.item() * input_ids.size(1)
+                total_tokens += input_ids.size(1)
+                
+            except Exception as e:
+                continue
+    
+    if total_tokens == 0:
+        return float('inf')
+    
+    avg_loss = total_loss / total_tokens
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    return perplexity
+
+def test_text_generation(model, tokenizer, device):
+    """测试文本生成"""
+    print("✍️ 测试文本生成...")
+    
+    test_prompts = [
+        "人工智能的未来发展",
+        "Once upon a time",
+        "The meaning of life is",
+        "科技改变了我们的生活"
+    ]
+    
+    results = []
+    
+    for prompt in test_prompts:
+        try:
+            inputs = tokenizer(prompt, return_tensors='pt').to(device)
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    inputs['input_ids'],
+                    max_length=inputs['input_ids'].size(1) + 50,
+                    num_return_sequences=1,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            
+            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            generated_text = generated_text[len(prompt):].strip()
+            
+            print(f"\n  提示词: '{prompt}'")
+            print(f"  生成: {generated_text[:100]}...")
+            
+            results.append({
+                'prompt': prompt,
+                'generated': generated_text
+            })
+            
+        except Exception as e:
+            print(f"  ❌ 生成'{prompt}'失败: {e}")
+            results.append({
+                'prompt': prompt,
+                'error': str(e)
+            })
+    
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="综合基准测试")
+    parser.add_argument("--datasets-only", action="store_true", help="只下载数据集")
+    parser.add_argument("--models-only", action="store_true", help="只下载模型")
+    parser.add_argument("--trained-model", type=str, default="checkpoints/final_model.pt", 
+                       help="训练的模型路径")
+    
+    args = parser.parse_args()
+    
     print("🚀 开始综合测试...")
     
-    # 检查GPU
+    # 设备信息
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
     
     if torch.cuda.is_available():
-        print(f"GPU信息: {torch.cuda.get_device_name()}")
-        print(f"显存: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU信息: {gpu_name}")
+        print(f"显存: {gpu_memory:.1f}GB")
     
-    # 下载数据集
-    datasets = download_benchmark_datasets()
-    
-    # 下载模型
-    models = download_pretrained_models()
-    
-    # 测试我们训练的模型
-    trained_model = test_trained_model()
-    if trained_model is not None:
-        models['our_trained_model'] = {
-            'model': trained_model['model'],
-            'tokenizer': trained_model['tokenizer'],
-            'info': {
-                'description': f"我们训练的{trained_model['config'].model_type}模型",
-                'size': f"{sum(p.numel() for p in trained_model['model'].parameters())/1e6:.1f}M"
-            }
-        }
-    
-    # 测试结果
-    test_results = {
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+    results = {
         'device': str(device),
-        'models': {}
+        'timestamp': time.time(),
+        'models': {},
+        'trained_model': None
     }
     
-    print("\n" + "="*60)
-    print("开始模型测试")
-    print("="*60)
+    # 下载数据集
+    if not args.models_only:
+        datasets = download_benchmarks()
+    else:
+        datasets = {}
     
-    for model_name, model_data in models.items():
-        if model_data is None:
-            continue
-            
-        print(f"\n🧪 测试模型: {model_name}")
-        print("-" * 40)
+    # 测试训练的模型
+    if not args.models_only and datasets:
+        trained_results = test_trained_model(args.trained_model, datasets)
+        if trained_results:
+            results['trained_model'] = trained_results
+    
+    # 下载和测试基准模型
+    if not args.datasets_only:
+        baseline_models = download_baseline_models()
         
-        try:
-            model = model_data['model'].to(device)
-            tokenizer = model_data['tokenizer']
+        print("\n" + "="*60)
+        print("开始模型测试")
+        print("="*60)
+        
+        for model_id, model_info in baseline_models.items():
+            print(f"\n🧪 测试模型: {model_id}")
+            print("-" * 40)
             
-            # 确保tokenizer有pad_token
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
+            model = model_info['model']
+            tokenizer = model_info['tokenizer']
             
             model_results = {
-                'model_info': model_data['info'],
+                'params': model_info['params'],
                 'perplexity': {},
-                'generation_test': None
+                'generation': []
             }
             
-            # 测试困惑度
+            # 困惑度测试
             for dataset_name, dataset in datasets.items():
-                if dataset is not None:
-                    try:
-                        ppl = evaluate_perplexity(model, tokenizer, dataset, max_samples=50)
-                        model_results['perplexity'][dataset_name] = ppl
-                        print(f"  {dataset_name} 困惑度: {ppl:.2f}")
-                    except Exception as e:
-                        print(f"  ❌ {dataset_name} 困惑度测试失败: {e}")
-                        model_results['perplexity'][dataset_name] = None
+                if dataset is None:
+                    continue
+                    
+                try:
+                    print(f"📊 计算困惑度...")
+                    perplexity = calculate_perplexity(model, tokenizer, dataset, device)
+                    model_results['perplexity'][dataset_name] = perplexity
+                    print(f"  {dataset_name} 困惑度: {perplexity:.2f}")
+                except Exception as e:
+                    print(f"  ❌ {dataset_name} 困惑度计算失败: {e}")
+                    model_results['perplexity'][dataset_name] = None
             
-            # 测试文本生成
+            # 文本生成测试
             try:
-                generation_results = test_text_generation(model, tokenizer)
-                model_results['generation_test'] = generation_results
+                generation_results = test_text_generation(model, tokenizer, device)
+                model_results['generation'] = generation_results
             except Exception as e:
-                print(f"  ❌ 文本生成测试失败: {e}")
-                model_results['generation_test'] = None
+                print(f"❌ 文本生成测试失败: {e}")
             
-            test_results['models'][model_name] = model_results
-            
-            # 清理GPU内存
-            del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-        except Exception as e:
-            print(f"❌ 模型 {model_name} 测试失败: {e}")
-            test_results['models'][model_name] = {'error': str(e)}
+            results['models'][model_id] = model_results
     
-    # 保存测试结果
+    # 保存结果
     results_dir = Path('test_results')
     results_dir.mkdir(exist_ok=True)
     
     results_file = results_dir / f'benchmark_results_{int(time.time())}.json'
     with open(results_file, 'w', encoding='utf-8') as f:
-        json.dump(test_results, f, indent=2, ensure_ascii=False)
+        json.dump(results, f, indent=2, ensure_ascii=False)
     
     print(f"\n📝 测试结果已保存至: {results_file}")
     
@@ -365,42 +418,19 @@ def run_comprehensive_test():
     print("测试总结")
     print("="*60)
     
-    for model_name, results in test_results['models'].items():
-        if 'error' in results:
-            print(f"❌ {model_name}: 测试失败")
-        else:
-            print(f"✅ {model_name}: 测试完成")
-            if results.get('perplexity'):
-                for dataset, ppl in results['perplexity'].items():
-                    if ppl is not None:
-                        print(f"   {dataset}: 困惑度 {ppl:.2f}")
-
-def main():
-    parser = argparse.ArgumentParser(description="自动化基准测试脚本")
-    parser.add_argument("--datasets-only", action="store_true", help="只下载数据集")
-    parser.add_argument("--models-only", action="store_true", help="只下载模型")
-    parser.add_argument("--quick-test", action="store_true", help="快速测试模式")
-    parser.add_argument("--test-trained", type=str, help="测试指定的训练模型")
-    parser.add_argument("--skip-download", action="store_true", help="跳过下载，只测试训练模型")
+    if results['trained_model']:
+        tm = results['trained_model']
+        print(f"🤖 训练的模型 ({tm['model_type']}):")
+        for dataset, result in tm['results'].items():
+            if 'perplexity' in result:
+                print(f"   {dataset}: 困惑度 {result['perplexity']:.2f}")
+        print()
     
-    args = parser.parse_args()
-    
-    if args.datasets_only:
-        download_benchmark_datasets()
-    elif args.models_only:
-        download_pretrained_models()
-    elif args.test_trained:
-        # 只测试指定的训练模型
-        test_trained_model(args.test_trained)
-    elif args.skip_download:
-        # 只测试我们的训练模型，不下载其他模型
-        trained_model = test_trained_model()
-        if trained_model is not None:
-            datasets = download_benchmark_datasets()
-            # 简化测试流程...
-            print("🧪 简化测试完成")
-    else:
-        run_comprehensive_test()
+    for model_id, model_result in results['models'].items():
+        print(f"✅ {model_id}: 测试完成")
+        for dataset, perplexity in model_result['perplexity'].items():
+            if perplexity is not None:
+                print(f"   {dataset}: 困惑度 {perplexity:.2f}")
 
 if __name__ == "__main__":
     main() 

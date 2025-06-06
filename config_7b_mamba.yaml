@@ -1,0 +1,64 @@
+# 7B Mamba模型配置 - 高效状态空间模型
+# 针对4张24GB GPU优化，显存效率比Transformer更高
+
+# 基础设置
+model_type: "mamba"
+num_gpus: 4
+
+# 模型配置 - 7B Mamba参数
+model:
+  vocab_size: 50257
+  max_seq_length: 4096      # Mamba支持更长序列
+  d_model: 4096
+  n_layers: 32              # 32层达到7B规模
+  d_state: 16               # Mamba状态维度
+  d_conv: 4                 # 卷积核大小
+  expand: 2                 # 扩展因子
+  dropout: 0.1
+
+# 训练配置 - 显存友好
+training:
+  dataset: "auto"
+  batch_size: 2                    # Mamba显存效率更高，可用更大批大小
+  gradient_accumulation_steps: 16  # 有效批大小 = 2 * 16 = 32
+  eval_batch_size: 1
+  max_length: 4096
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_steps: 200000
+  warmup_steps: 10000
+  eval_steps: 5000
+  save_steps: 10000
+  logging_steps: 100
+  fp16: true                       # 启用混合精度
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  use_wandb: false
+  wandb_project: "rag-transformer"
+  run_name: "7b_mamba"
+
+# 数据集配置 - 大规模训练
+datasets:
+  primary: "openwebtext"           # 主要数据集
+  secondary: ["c4", "bookcorpus"]  # 辅助数据集
+  mixing_ratio: [0.6, 0.25, 0.15] # 混合比例
+
+# 显存优化设置
+optimization:
+  gradient_checkpointing: true     # 启用梯度检查点
+  cpu_offload: false              # Mamba通常不需要CPU卸载
+  pin_memory: true                # 固定内存加速
+  num_workers: 6                  # 数据加载器工作进程
+
+# 系统配置
+system:
+  auto_shutdown: true
+  shutdown_delay: 300             # 5分钟延迟
+  save_memory: true               # 节省显存模式
+
+# Mamba特有优化
+mamba_config:
+  use_fast_path: true             # 使用快速路径优化
+  selective_scan: true            # 选择性扫描
+  hardware_aware: true            # 硬件感知优化 
