@@ -40,13 +40,9 @@ if [ ! -f "deepspeed_single_a800_80g.json" ]; then
     exit 1
 fi
 
-# 启动训练 - 单GPU不需要deepspeed启动器
-python train_deepspeed.py \
+# 启动训练 - 使用DeepSpeed启动器确保与train_deepspeed.py兼容
+deepspeed --num_gpus=1 train_deepspeed.py \
     --preset 7b_mamba \
-    --deepspeed_config deepspeed_single_a800_80g.json \
-    --max_seq_length 1024 \
-    --save_steps 500 \
-    --eval_steps 250 \
-    --logging_steps 50
+    --deepspeed_config deepspeed_single_a800_80g.json
 
 echo "✅ 训练完成！" 
