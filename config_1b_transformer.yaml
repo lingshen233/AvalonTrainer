@@ -1,0 +1,57 @@
+# 1B Transformer 模型配置
+# 适合单卡RTX 4090或多卡RTX 3090训练
+
+# 基础设置
+model_type: "transformer"
+num_gpus: 1
+
+# 模型配置 - 1B参数
+model:
+  vocab_size: 50257
+  max_seq_length: 2048
+  d_model: 2048
+  n_layers: 24
+  n_heads: 16
+  d_ff: 8192
+  dropout: 0.1
+
+# 训练配置
+training:
+  dataset: "wikitext"           # 主数据集
+  secondary_datasets:           # 辅助数据集
+    - "bookcorpus"
+    - "cc_news"
+  mix_ratio: [0.4, 0.3, 0.3]   # 数据集混合比例
+  
+  batch_size: 4                 # 单GPU批大小
+  gradient_accumulation_steps: 4
+  max_length: 2048
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  max_steps: 100000
+  warmup_steps: 2000
+  eval_steps: 2000
+  save_steps: 5000
+  logging_steps: 100
+  
+  fp16: true
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  
+  # Weights & Biases
+  use_wandb: false
+  wandb_project: "rag-transformer-1b"
+  run_name: "transformer_1b_wikitext"
+
+# 系统配置
+system:
+  auto_shutdown: false
+  shutdown_delay: 60
+
+# 数据集配置
+data:
+  streaming: true              # 流式加载大数据集
+  max_samples_per_dataset: null  # null表示使用全部数据
+  cache_dir: "./data_cache" 

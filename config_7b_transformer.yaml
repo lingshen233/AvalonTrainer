@@ -1,0 +1,57 @@
+# 7B Transformer 模型配置
+# 需要多卡A100或RTX 4090训练
+
+# 基础设置
+model_type: "transformer"
+num_gpus: 4                    # 推荐4卡以上
+
+# 模型配置 - 7B参数
+model:
+  vocab_size: 50257
+  max_seq_length: 4096         # 更长序列
+  d_model: 4096                # 更大隐层
+  n_layers: 32                 # 32层
+  n_heads: 32                  # 32个注意力头
+  d_ff: 16384                  # 更大前馈网络
+  dropout: 0.1
+
+# 训练配置
+training:
+  dataset: "openwebtext"       # 高质量大规模数据集
+  secondary_datasets:
+    - "c4"
+    - "the_pile"
+  mix_ratio: [0.5, 0.3, 0.2]
+  
+  batch_size: 2                # 每GPU批大小
+  gradient_accumulation_steps: 8
+  max_length: 4096
+  learning_rate: 1e-4          # 更小学习率
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  max_steps: 300000            # 更多训练步数
+  warmup_steps: 5000
+  eval_steps: 5000
+  save_steps: 10000
+  logging_steps: 100
+  
+  fp16: true
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  
+  # Weights & Biases
+  use_wandb: true              # 推荐开启实验跟踪
+  wandb_project: "rag-transformer-7b"
+  run_name: "transformer_7b_openwebtext"
+
+# 系统配置
+system:
+  auto_shutdown: true          # 长时间训练推荐自动关机
+  shutdown_delay: 300          # 5分钟倒计时
+
+# 数据集配置
+data:
+  streaming: true
+  max_samples_per_dataset: null
+  cache_dir: "./data_cache" 

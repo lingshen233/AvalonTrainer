@@ -18,6 +18,8 @@ import platform
 
 from configs.presets import get_config, calculate_model_size, estimate_memory_usage, list_available_configs
 from configs.base import ModelConfig, TrainingConfig
+from configs.model_presets import MODEL_PRESETS, list_model_presets, get_model_preset
+from data.dataset_manager import DatasetManager
 from models import create_model
 from trainers.base import BaseTrainer
 from data.processor import DataProcessor
@@ -104,20 +106,30 @@ def create_configs_from_yaml(yaml_config):
         else:
             batch_size = 4 if yaml_config['num_gpus'] == 1 else 6
     
-    # 模型配置
-    model_config = ModelConfig(
-        model_type=yaml_config['model_type'],
-        vocab_size=yaml_config['model']['vocab_size'],
-        max_seq_length=yaml_config['model']['max_seq_length'],
-        d_model=yaml_config['model']['d_model'],
-        n_layers=yaml_config['model']['n_layers'],
-        dropout=yaml_config['model']['dropout'],
-        n_heads=yaml_config['model']['n_heads'],
-        d_ff=yaml_config['model']['d_ff'],
-        d_state=yaml_config['model']['d_state'],
-        d_conv=yaml_config['model']['d_conv'],
-        expand=yaml_config['model']['expand']
-    )
+    # 模型配置 - 根据模型类型设置参数
+    model_params = {
+        'model_type': yaml_config['model_type'],
+        'vocab_size': yaml_config['model']['vocab_size'],
+        'max_seq_length': yaml_config['model']['max_seq_length'],
+        'd_model': yaml_config['model']['d_model'],
+        'n_layers': yaml_config['model']['n_layers'],
+        'dropout': yaml_config['model']['dropout']
+    }
+    
+    # 根据模型类型添加特定参数
+    if yaml_config['model_type'] == 'transformer':
+        model_params.update({
+            'n_heads': yaml_config['model']['n_heads'],
+            'd_ff': yaml_config['model']['d_ff']
+        })
+    elif yaml_config['model_type'] == 'mamba':
+        model_params.update({
+            'd_state': yaml_config['model'].get('d_state', 16),
+            'd_conv': yaml_config['model'].get('d_conv', 4),
+            'expand': yaml_config['model'].get('expand', 2)
+        })
+    
+    model_config = ModelConfig(**model_params)
     
     # 训练配置
     training_config = TrainingConfig(
@@ -218,7 +230,10 @@ def main():
     parser.add_argument("--config", type=str, default="config.yaml", help="配置文件路径")
     parser.add_argument("--model_type", type=str, choices=["transformer", "mamba"], help="模型类型")
     parser.add_argument("--num_gpus", type=int, help="GPU数量")
+    parser.add_argument("--preset", type=str, help="使用预设配置 (如: 1b_transformer, 7b_mamba)")
     parser.add_argument("--list_models", action="store_true", help="列出可用模型")
+    parser.add_argument("--list_presets", action="store_true", help="列出可用预设配置")
+    parser.add_argument("--list_datasets", action="store_true", help="列出可用数据集")
     parser.add_argument("--dry_run", action="store_true", help="只验证配置")
     parser.add_argument("--no_shutdown", action="store_true", help="禁用自动关机")
     
@@ -231,24 +246,67 @@ def main():
             print(f"  {model_type}: {desc}")
         return
     
-    # 加载配置
-    if os.path.exists(args.config):
-        yaml_config = load_config(args.config)
-        print(f"✅ 加载配置文件: {args.config}")
-    else:
-        print(f"❌ 配置文件不存在: {args.config}")
+    # 列出预设配置
+    if args.list_presets:
+        list_model_presets()
         return
     
-    # 命令行参数覆盖
-    if args.model_type:
-        yaml_config['model_type'] = args.model_type
-    if args.num_gpus:
-        yaml_config['num_gpus'] = args.num_gpus
-    if args.no_shutdown:
-        yaml_config['system']['auto_shutdown'] = False
+    # 列出数据集
+    if args.list_datasets:
+        manager = DatasetManager()
+        manager.list_datasets()
+        return
     
-    # 创建配置
-    model_config, training_config = create_configs_from_yaml(yaml_config)
+    # 处理预设配置
+    if args.preset:
+        if args.preset not in MODEL_PRESETS:
+            print(f"❌ 未知预设配置: {args.preset}")
+            print("可用预设:")
+            for preset_id in MODEL_PRESETS.keys():
+                print(f"  {preset_id}")
+            return
+        
+        preset_config = get_model_preset(args.preset)
+        model_config = preset_config['model']
+        
+        # 为预设生成训练配置
+        from configs.model_presets import get_training_config_for_model_size
+        training_config = get_training_config_for_model_size(
+            args.preset, 
+            args.num_gpus or 1
+        )
+        
+        print(f"✅ 使用预设配置: {preset_config['description']}")
+        print(f"   参数量: {preset_config['params']}")
+        print(f"   显存需求: {preset_config['memory_estimate']}")
+        print(f"   推荐数据集: {', '.join(preset_config['datasets'])}")
+        
+        # 创建虚拟的yaml_config用于后续处理
+        yaml_config = {
+            'model_type': model_config.model_type,
+            'num_gpus': args.num_gpus or 1,
+            'system': {'auto_shutdown': False, 'shutdown_delay': 60}
+        }
+        
+    else:
+        # 加载配置文件
+        if os.path.exists(args.config):
+            yaml_config = load_config(args.config)
+            print(f"✅ 加载配置文件: {args.config}")
+        else:
+            print(f"❌ 配置文件不存在: {args.config}")
+            return
+        
+        # 命令行参数覆盖
+        if args.model_type:
+            yaml_config['model_type'] = args.model_type
+        if args.num_gpus:
+            yaml_config['num_gpus'] = args.num_gpus
+        if args.no_shutdown:
+            yaml_config['system']['auto_shutdown'] = False
+        
+        # 创建配置
+        model_config, training_config = create_configs_from_yaml(yaml_config)
     
     # 计算资源需求
     total_params = calculate_model_size(model_config)
