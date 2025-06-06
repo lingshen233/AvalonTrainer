@@ -204,7 +204,7 @@ class TransformerModel(nn.Module):
                 if next_token.item() == 50256:  # GPT-2的结束符
                     break
         
-        return input_ids
+        return input_ids 
 
 # 兼容性别名
 Transformer = TransformerModel 

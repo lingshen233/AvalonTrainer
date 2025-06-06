@@ -1,11 +1,18 @@
 # RAG Transformer - 多GPU训练框架
 
-一个简洁高效的多GPU深度学习训练框架，专注于Transformer和Mamba模型训练。
+一个简洁高效的多GPU深度学习训练框架，专注于Transformer和Mamba模型训练。**现支持DeepSpeed ZeRO优化，可在有限显存下训练真正的7B模型！**
 
 ## 🚀 特性
 
+### 🔥 **NEW: DeepSpeed ZeRO优化**
+- **ZeRO-2分片**: 将7B模型显存需求从87GB降至23GB/GPU
+- **真正7B训练**: 在4张24GB GPU上训练6.89B参数的大模型
+- **智能显存管理**: 参数分片 + 优化器分片 + 梯度重叠
+- **一键启动**: `./launch_deepspeed.sh --num_gpus 4 --preset 7b_mamba`
+
+### 🎯 **核心功能**
 - **双模型支持**: Transformer和Mamba状态空间模型
-- **多GPU训练**: 支持1-8个GPU并行训练（PyTorch DDP）
+- **多训练模式**: DataParallel + DeepSpeed ZeRO + 单机多卡
 - **智能批大小**: 自动根据GPU数量和模型类型优化批大小
 - **YAML配置**: 简单直观的配置文件系统
 - **显存优化**: 自动估算显存需求，避免OOM错误
@@ -51,6 +58,8 @@ python train.py --list_models
 ```
 
 ### 3. 选择训练规模
+
+**标准训练模式：**
 ```bash
 # 1B模型训练 (适合单卡RTX 4090)
 python train.py --preset 1b_transformer
@@ -60,6 +69,24 @@ python train.py --preset 7b_transformer --num_gpus 4
 
 # Mamba模型 (显存效率更高)
 python train.py --preset 1b_mamba
+```
+
+**🔥 DeepSpeed ZeRO优化训练（推荐大模型）：**
+```bash
+# 安装DeepSpeed
+./install_deepspeed.sh
+
+# 真正7B模型训练 (4张24GB GPU)
+./launch_deepspeed.sh --num_gpus 4 --preset 7b_mamba
+
+# 推荐配置 (6张24GB GPU，更安全)
+./launch_deepspeed.sh --num_gpus 6 --preset 7b_mamba
+
+# 诚实3B模型 (如果7B太大)
+./launch_deepspeed.sh --num_gpus 4 --preset 3b_mamba
+
+# 检查显存需求
+python memory_calculator.py
 ```
 
 ### 4. 数据集管理
@@ -130,20 +157,26 @@ python test_after_training.py --checkpoint checkpoints/best_model.pt
 
 ## 📊 模型对比
 
-| 预设配置 | 模型类型 | 参数量 | 估算显存 | 推荐GPU | 适用场景 |
+### 标准训练模式（DataParallel）
+| 预设配置 | 模型类型 | 参数量 | 显存需求 | 推荐GPU | 适用场景 |
 |----------|----------|--------|----------|---------|----------|
 | **1b_transformer** | Transformer | 1.0B | 12GB/GPU | RTX 4090×1 | 通用语言建模 |
 | **1b_mamba** | Mamba | 1.0B | 9GB/GPU | RTX 3090×1 | 高效长序列处理 |
-| **7b_transformer** | Transformer | 7.0B | 28GB/GPU | RTX 4090×4 | 大规模语言建模 |
-| **7b_mamba** | Mamba | 7.0B | 20GB/GPU | RTX 4090×2 | 高效大模型训练 |
 | **test_small** | Transformer | 50M | 2GB/GPU | 任意GPU | 快速测试验证 |
 
-### 数据集推荐
+### 🔥 DeepSpeed ZeRO-2优化模式
+| 预设配置 | 模型类型 | 参数量 | 显存需求 | 推荐GPU | 突破意义 |
+|----------|----------|--------|----------|---------|----------|
+| **7b_mamba** | Mamba | **6.89B** | 23.1GB/GPU | RTX 4090×4 | 🎯 **真正7B大模型** |
+| **7b_mamba** | Mamba | 6.89B | 16.1GB/GPU | RTX 4090×6 | ✅ **安全训练** |
+| **7b_mamba** | Mamba | 6.89B | 12.6GB/GPU | RTX 4090×8 | 🚀 **最佳性能** |
+| **3b_mamba** | Mamba | 2.84B | 15GB/GPU | RTX 4090×4 | 📚 **诚实3B** |
 
-| 模型规模 | 英文数据集 | 中文数据集 | 总大小 | 训练时间估算 |
-|----------|------------|------------|--------|--------------|
-| **1B** | WikiText + BookCorpus + CC-News | 中文网页文本 | ~80GB | 3-5天 |
-| **7B** | OpenWebText + C4 + The Pile | 中文网页文本 | ~1TB+ | 2-3周 |
+### 显存效率对比
+| 训练方式 | 7B模型显存 | GPU数量 | 总显存需求 | 可行性 |
+|----------|-----------|---------|------------|--------|
+| DataParallel | 87.5GB/GPU | 4 | 350GB | ❌ 不可行 |
+| **DeepSpeed ZeRO-2** | **23.1GB/GPU** | **4** | **92.4GB** | ✅ **可行** |
 
 ## ⚙️ 配置文件
 
@@ -440,6 +473,40 @@ GPU数量: 4
 ## 🤝 贡献
 
 欢迎提交Issue和Pull Request！
+
+## 📚 相关文档
+
+- **[DeepSpeed ZeRO训练指南](README_DEEPSPEED.md)** - 详细的7B模型训练教程
+- **[显存需求计算器](memory_calculator.py)** - 精确估算不同配置的显存需求
+- **[模型预设配置](configs/model_presets.py)** - 所有可用的模型配置
+- **[安装脚本说明](install_deepspeed.sh)** - DeepSpeed自动安装
+
+### 脚本快速参考
+```bash
+# DeepSpeed相关
+./install_deepspeed.sh          # 安装DeepSpeed
+./launch_deepspeed.sh --help    # 查看DeepSpeed训练选项
+python memory_calculator.py     # 计算显存需求
+
+# 标准训练
+python train.py --list_presets  # 查看所有预设
+python train_memory_optimized.py # 单机多卡优化版
+```
+
+## 📈 最新更新
+
+### v2.0 - DeepSpeed ZeRO优化
+- ✅ **ZeRO-2分片**: 将7B模型显存从87GB降至23GB/GPU
+- ✅ **真正7B训练**: 支持6.89B参数的大模型训练  
+- ✅ **一键启动**: 简化的启动脚本和配置
+- ✅ **智能显存管理**: 自动分片和优化
+- ✅ **诚实标注**: 不再有"参数量欺骗"
+
+### v1.0 - 基础框架
+- ✅ Transformer和Mamba模型支持
+- ✅ 多GPU DataParallel训练
+- ✅ YAML配置系统
+- ✅ 自动关机功能
 
 ## �� 许可证
 

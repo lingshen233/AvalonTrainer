@@ -1,28 +1,28 @@
-# 7B Mamba模型配置 - 显存优化版
-# 针对4张24GB GPU优化，更保守的配置
+# 真正的7B Mamba模型配置 - 6.89B参数
+# ⚠️ 需要40GB显存/GPU或8张24GB GPU
 
 # 基础设置
 model_type: "mamba"
-num_gpus: 4
+num_gpus: 8  # 建议8张24GB GPU分摊显存
 
-# 模型配置 - 优化后的7B Mamba参数
+# 模型配置 - 真正的7B参数 (6.89B)
 model:
   vocab_size: 50257
-  max_seq_length: 2048      # 减小序列长度节省显存
-  d_model: 3584            # 稍微减小隐层维度
-  n_layers: 32              # 32层达到7B规模
+  max_seq_length: 4096      # 7B模型应有的序列长度
+  d_model: 4864            # 真正的7B隐层维度
+  n_layers: 45              # 45层达到6.89B
   d_state: 16               # Mamba状态维度
   d_conv: 4                 # 卷积核大小
   expand: 2                 # 扩展因子
   dropout: 0.1
 
-# 训练配置 - 极度显存友好
+# 训练配置 - 针对大模型优化
 training:
   dataset: "auto"
-  batch_size: 1                    # 极小批大小
-  gradient_accumulation_steps: 32  # 大梯度累积补偿
+  batch_size: 1                    # 每GPU最小批大小
+  gradient_accumulation_steps: 32  # 保持有效批大小
   eval_batch_size: 1
-  max_length: 1024                 # 减小序列长度
+  max_length: 4096                 # 完整序列长度
   learning_rate: 1e-4
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -36,29 +36,29 @@ training:
   checkpoint_dir: "./checkpoints"
   use_wandb: false
   wandb_project: "rag-transformer"
-  run_name: "7b_mamba_optimized"
+  run_name: "7b_mamba_real"
 
-# 数据集配置 - 大规模训练
+# 数据集配置
 datasets:
-  primary: "openwebtext"           # 主要数据集
-  secondary: ["c4", "bookcorpus"]  # 辅助数据集
-  mixing_ratio: [0.6, 0.25, 0.15] # 混合比例
+  primary: "openwebtext"
+  secondary: ["c4", "the_pile"]
+  mixing_ratio: [0.5, 0.3, 0.2]
 
 # 显存优化设置
 optimization:
-  gradient_checkpointing: true     # 启用梯度检查点
-  cpu_offload: false              # Mamba通常不需要CPU卸载
-  pin_memory: true                # 固定内存加速
-  num_workers: 4                  # 减少数据加载器工作进程
+  gradient_checkpointing: true     # 必须启用
+  cpu_offload: false
+  pin_memory: true
+  num_workers: 4
 
 # 系统配置
 system:
-  auto_shutdown: false            # 关闭自动关机
-  shutdown_delay: 300             # 5分钟延迟
-  save_memory: true               # 节省显存模式
+  auto_shutdown: false
+  shutdown_delay: 300
+  save_memory: true
 
-# Mamba特有优化
+# Mamba优化
 mamba_config:
-  use_fast_path: true             # 使用快速路径优化
-  selective_scan: true            # 选择性扫描
-  hardware_aware: true            # 硬件感知优化 
+  use_fast_path: true
+  selective_scan: true
+  hardware_aware: true 

@@ -15,7 +15,7 @@ class TextDataset(Dataset):
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
-    
+        
     def __len__(self):
         return len(self.texts)
     
@@ -46,8 +46,8 @@ class DataProcessor:
     def setup_tokenizer(self):
         """设置分词器"""
         self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+    
         self.data_collator = DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer,
             mlm=False,

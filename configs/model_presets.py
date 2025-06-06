@@ -69,19 +69,44 @@ MODEL_PRESETS = {
         'model': ModelConfig(
             model_type='mamba',
             vocab_size=50257,
-            max_seq_length=2048,     # 减小序列长度
-            d_model=3584,            # 优化后的隐层维度
+            max_seq_length=4096,     # 7B应有的序列长度
+            d_model=4864,            # 微调到7B
+            n_layers=45,             # 微调层数
+            d_state=16,
+            d_conv=4,
+            expand=2,
+            dropout=0.1
+        ),
+        'description': 'Mamba 7B - 真正的7B状态空间模型',
+        'params': '7.0B',
+        'memory_estimate': '35GB/GPU',
+        'recommended_gpus': [8],
+        'datasets': ['openwebtext', 'c4', 'the_pile'],
+        'notes': [
+            '⚠️ 真正的7B模型，需要40GB显存/GPU或8张24GB GPU',
+            '建议使用8张A100-24GB或4张A100-40GB',
+            '如显存不足，请使用3b_mamba预设'
+        ]
+    },
+    
+    # 添加诚实的3B配置
+    '3b_mamba': {
+        'model': ModelConfig(
+            model_type='mamba',
+            vocab_size=50257,
+            max_seq_length=2048,
+            d_model=3584,
             n_layers=32,
             d_state=16,
             d_conv=4,
             expand=2,
             dropout=0.1
         ),
-        'description': 'Mamba 7B - 显存优化的状态空间模型',
+        'description': 'Mamba 3B - 适合24GB GPU的大模型',
         'params': '2.8B',
         'memory_estimate': '15GB/GPU',
-        'recommended_gpus': [2, 4, 8],
-        'datasets': ['openwebtext', 'c4', 'the_pile']
+        'recommended_gpus': [2, 4],
+        'datasets': ['openwebtext', 'c4', 'bookcorpus']
     },
     
     # 测试配置
@@ -194,7 +219,7 @@ def get_model_preset(preset_id: str):
     return MODEL_PRESETS[preset_id]
 
 def calculate_model_parameters(config: ModelConfig):
-    """估算模型参数量"""
+    """准确估算模型参数量"""
     if config.model_type == 'transformer':
         # Transformer参数估算
         embedding_params = config.vocab_size * config.d_model
@@ -207,14 +232,38 @@ def calculate_model_parameters(config: ModelConfig):
         total_params = embedding_params + config.n_layers * layer_params
         
     elif config.model_type == 'mamba':
-        # Mamba参数估算（简化）
+        # Mamba参数精确估算
         embedding_params = config.vocab_size * config.d_model
         
-        # 每层参数（状态空间模型）
-        layer_params = config.d_model * config.d_model * config.expand * 2
-        layer_params += config.d_state * config.d_model  # 状态参数
+        # 每层Mamba块参数
+        d_inner = config.d_model * config.expand  # 内部维度
         
-        total_params = embedding_params + config.n_layers * layer_params
+        # 输入投影层 (x_proj, z_proj)
+        in_proj_params = config.d_model * (d_inner * 2)
+        
+        # 卷积层
+        conv_params = d_inner * config.d_conv
+        
+        # 状态空间参数 (A, B, C, dt)
+        ss_params = d_inner * config.d_state  # A matrix
+        ss_params += d_inner * config.d_state  # B projection
+        ss_params += d_inner  # C projection
+        ss_params += d_inner  # dt projection
+        
+        # 输出投影
+        out_proj_params = d_inner * config.d_model
+        
+        # 层归一化参数
+        norm_params = config.d_model
+        
+        # 每层总参数
+        layer_params = in_proj_params + conv_params + ss_params + out_proj_params + norm_params
+        
+        # 最终层归一化和语言模型头
+        final_norm_params = config.d_model
+        lm_head_params = config.vocab_size * config.d_model
+        
+        total_params = embedding_params + (config.n_layers * layer_params) + final_norm_params + lm_head_params
     
     else:
         total_params = 0

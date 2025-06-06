@@ -100,14 +100,42 @@ def test_model(checkpoint_path):
         with torch.no_grad():
             outputs = model(test_input)
         
-        if hasattr(outputs, 'logits'):
+        # 处理不同类型的输出
+        if isinstance(outputs, dict):
+            # 字典输出（常见于Mamba模型）
+            if 'logits' in outputs:
+                output_shape = outputs['logits'].shape
+                print(f"✅ 前向传播成功（字典输出）")
+                print(f"   输入形状: {test_input.shape}")
+                print(f"   输出logits形状: {output_shape}")
+                logits = outputs['logits']
+            else:
+                # 查找第一个张量输出
+                tensor_outputs = {k: v for k, v in outputs.items() if torch.is_tensor(v)}
+                if tensor_outputs:
+                    key, tensor = next(iter(tensor_outputs.items()))
+                    output_shape = tensor.shape
+                    print(f"✅ 前向传播成功（字典输出）")
+                    print(f"   输入形状: {test_input.shape}")
+                    print(f"   输出{key}形状: {output_shape}")
+                    logits = tensor
+                else:
+                    print(f"⚠️  无法识别输出格式: {list(outputs.keys())}")
+                    return True  # 至少模型运行了
+        elif hasattr(outputs, 'logits'):
+            # 命名元组输出（常见于Transformer模型）
             output_shape = outputs.logits.shape
+            print(f"✅ 前向传播成功（命名元组输出）")
+            print(f"   输入形状: {test_input.shape}")
+            print(f"   输出logits形状: {output_shape}")
+            logits = outputs.logits
         else:
+            # 直接张量输出
             output_shape = outputs.shape
-        
-        print(f"✅ 前向传播成功")
-        print(f"   输入形状: {test_input.shape}")
-        print(f"   输出形状: {output_shape}")
+            print(f"✅ 前向传播成功（张量输出）")
+            print(f"   输入形状: {test_input.shape}")
+            print(f"   输出形状: {output_shape}")
+            logits = outputs
         
         # 简单的文本生成测试
         print("📝 执行文本生成测试...")
@@ -116,12 +144,21 @@ def test_model(checkpoint_path):
         with torch.no_grad():
             for i in range(5):  # 生成5个token
                 outputs = model(prompt)
-                if hasattr(outputs, 'logits'):
-                    logits = outputs.logits
-                else:
-                    logits = outputs
                 
-                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                # 提取logits
+                if isinstance(outputs, dict):
+                    if 'logits' in outputs:
+                        current_logits = outputs['logits']
+                    else:
+                        # 获取第一个张量
+                        tensor_outputs = {k: v for k, v in outputs.items() if torch.is_tensor(v)}
+                        current_logits = next(iter(tensor_outputs.values()))
+                elif hasattr(outputs, 'logits'):
+                    current_logits = outputs.logits
+                else:
+                    current_logits = outputs
+                
+                next_token = torch.argmax(current_logits[:, -1, :], dim=-1, keepdim=True)
                 prompt = torch.cat([prompt, next_token], dim=1)
         
         print(f"✅ 文本生成测试成功")

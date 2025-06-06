@@ -1,0 +1,64 @@
+# 3B Mamba模型配置 - 适合24GB GPU
+# 诚实的2.8B参数模型，不是"伪7B"
+
+# 基础设置
+model_type: "mamba"
+num_gpus: 4
+
+# 模型配置 - 真实的3B参数
+model:
+  vocab_size: 50257
+  max_seq_length: 2048      # 适合显存的序列长度
+  d_model: 3584            # 3B规模的隐层维度
+  n_layers: 32              # 深度换取参数效率
+  d_state: 16               # Mamba状态维度
+  d_conv: 4                 # 卷积核大小
+  expand: 2                 # 扩展因子
+  dropout: 0.1
+
+# 训练配置 - 24GB GPU友好
+training:
+  dataset: "auto"
+  batch_size: 2                    # 可用更大批大小
+  gradient_accumulation_steps: 16  # 有效批大小 = 2 * 16 = 32
+  eval_batch_size: 2
+  max_length: 2048                 # 显存友好的序列长度
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_steps: 150000
+  warmup_steps: 7500
+  eval_steps: 3000
+  save_steps: 7500
+  logging_steps: 100
+  fp16: true
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  use_wandb: false
+  wandb_project: "rag-transformer"
+  run_name: "3b_mamba"
+
+# 数据集配置
+datasets:
+  primary: "openwebtext"
+  secondary: ["c4", "bookcorpus"]
+  mixing_ratio: [0.6, 0.25, 0.15]
+
+# 显存优化设置
+optimization:
+  gradient_checkpointing: true
+  cpu_offload: false
+  pin_memory: true
+  num_workers: 6
+
+# 系统配置
+system:
+  auto_shutdown: false
+  shutdown_delay: 300
+  save_memory: false  # 3B不需要极端节省
+
+# Mamba优化
+mamba_config:
+  use_fast_path: true
+  selective_scan: true
+  hardware_aware: true 
