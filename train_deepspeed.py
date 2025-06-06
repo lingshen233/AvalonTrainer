@@ -442,8 +442,8 @@ def main():
         json.dump(ds_config, f, indent=2)
     
     # 打印配置信息
-    total_params = (model_config.vocab_size * model_config.d_model + 
-                   model_config.n_layers * model_config.d_model * model_config.d_model * 4)
+    from configs.model_presets import calculate_model_parameters
+    total_params = calculate_model_parameters(model_config)
     
     print(f"\n📊 DeepSpeed训练配置:")
     print(f"模型类型: {model_config.model_type}")
