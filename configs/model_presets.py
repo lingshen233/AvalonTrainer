@@ -69,17 +69,17 @@ MODEL_PRESETS = {
         'model': ModelConfig(
             model_type='mamba',
             vocab_size=50257,
-            max_seq_length=4096,
-            d_model=4096,
+            max_seq_length=2048,     # 减小序列长度
+            d_model=3584,            # 优化后的隐层维度
             n_layers=32,
             d_state=16,
             d_conv=4,
             expand=2,
             dropout=0.1
         ),
-        'description': 'Mamba 7B - 大规模状态空间模型',
-        'params': '7.0B',
-        'memory_estimate': '20GB/GPU',
+        'description': 'Mamba 7B - 显存优化的状态空间模型',
+        'params': '2.8B',
+        'memory_estimate': '15GB/GPU',
         'recommended_gpus': [2, 4, 8],
         'datasets': ['openwebtext', 'c4', 'the_pile']
     },

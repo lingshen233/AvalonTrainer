@@ -132,11 +132,36 @@ def calculate_model_size(model_config):
         layer_params = attention_params + ffn_params
         total_params = embedding_params + model_config.n_layers * layer_params
     elif model_config.model_type == 'mamba':
-        # Mamba参数估算
+        # Mamba参数估算（更准确）
         embedding_params = model_config.vocab_size * model_config.d_model
-        layer_params = model_config.d_model * model_config.d_model * model_config.expand * 2
-        layer_params += model_config.d_state * model_config.d_model
-        total_params = embedding_params + model_config.n_layers * layer_params
+        
+        # 每层Mamba块的参数
+        d_inner = model_config.d_model * model_config.expand  # inner dimension
+        
+        # 输入投影层
+        in_proj_params = model_config.d_model * (d_inner * 2)  # x and z projections
+        
+        # 卷积层
+        conv_params = d_inner * model_config.d_conv
+        
+        # 状态空间参数
+        ss_params = d_inner * model_config.d_state  # A and B matrices
+        dt_params = d_inner  # dt projection
+        
+        # 输出投影
+        out_proj_params = d_inner * model_config.d_model
+        
+        # 层归一化
+        norm_params = model_config.d_model
+        
+        # 每层总参数
+        layer_params = in_proj_params + conv_params + ss_params + dt_params + out_proj_params + norm_params
+        
+        # 最终层归一化和语言模型头
+        final_norm_params = model_config.d_model
+        lm_head_params = model_config.vocab_size * model_config.d_model
+        
+        total_params = embedding_params + (model_config.n_layers * layer_params) + final_norm_params + lm_head_params
     else:
         total_params = 0
     
@@ -206,7 +231,7 @@ class OptimizedTrainer:
             try:
                 # 创建虚拟批次数据
                 batch_size = self.config.train_batch_size
-                seq_length = self.config.max_length
+                seq_length = min(self.config.max_length, 1024)  # 限制序列长度
                 
                 # 生成随机输入数据
                 input_ids = torch.randint(0, 50257, (batch_size, seq_length))
@@ -215,7 +240,7 @@ class OptimizedTrainer:
                 input_ids = input_ids.to(self.device)
                 
                 # 前向传播
-                with torch.cuda.amp.autocast(enabled=self.config.fp16):
+                with torch.amp.autocast('cuda', enabled=self.config.fp16):
                     outputs = self.model(input_ids)
                     
                     # 计算损失
@@ -239,13 +264,28 @@ class OptimizedTrainer:
                 
                 # 清理
                 del input_ids, outputs, logits, loss
-                if step % 10 == 0:  # 每10步清理一次
+                if step % 5 == 0:  # 每5步清理一次（更频繁）
                     clear_gpu_memory()
                 
             except torch.cuda.OutOfMemoryError as e:
                 print(f"❌ 步骤 {step} 显存不足: {e}")
-                print("🔧 尝试减小批大小...")
-                break
+                print(f"🔧 批大小 {batch_size}, 序列长度 {seq_length} 仍然过大")
+                
+                # 尝试更激进的减少
+                if batch_size > 1:
+                    self.config.train_batch_size = max(1, batch_size // 2)
+                    print(f"🔧 减小批大小至 {self.config.train_batch_size}")
+                elif seq_length > 256:
+                    seq_length = max(256, seq_length // 2)
+                    print(f"🔧 减小序列长度至 {seq_length}")
+                else:
+                    print("❌ 无法进一步减小参数，模型可能太大")
+                    break
+                    
+                # 清理后重试
+                clear_gpu_memory()
+                continue
+                
             except Exception as e:
                 print(f"❌ 步骤 {step} 训练错误: {e}")
                 break
@@ -256,9 +296,32 @@ class OptimizedTrainer:
         # 如果使用了DataParallel，需要保存module
         model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
         
+        # 构建完整的配置字典
+        config_dict = {
+            'model_type': getattr(model_to_save, 'config', {}).get('model_type') or 
+                         getattr(model_to_save, 'model_type', 'mamba'),
+            'vocab_size': getattr(model_to_save.config, 'vocab_size', 50257) if hasattr(model_to_save, 'config') else 50257,
+            'd_model': getattr(model_to_save.config, 'd_model', 4096) if hasattr(model_to_save, 'config') else 4096,
+            'n_layers': getattr(model_to_save.config, 'n_layers', 32) if hasattr(model_to_save, 'config') else 32,
+            'max_seq_length': getattr(model_to_save.config, 'max_seq_length', 4096) if hasattr(model_to_save, 'config') else 4096,
+        }
+        
+        # 添加Mamba特有参数
+        if 'mamba' in config_dict['model_type']:
+            config_dict.update({
+                'd_state': getattr(model_to_save.config, 'd_state', 16) if hasattr(model_to_save, 'config') else 16,
+                'd_conv': getattr(model_to_save.config, 'd_conv', 4) if hasattr(model_to_save, 'config') else 4,
+                'expand': getattr(model_to_save.config, 'expand', 2) if hasattr(model_to_save, 'config') else 2,
+            })
+        else:
+            config_dict.update({
+                'n_heads': getattr(model_to_save.config, 'n_heads', 32) if hasattr(model_to_save, 'config') else 32,
+                'd_ff': getattr(model_to_save.config, 'd_ff', 16384) if hasattr(model_to_save, 'config') else 16384,
+            })
+        
         torch.save({
             'model_state_dict': model_to_save.state_dict(),
-            'config': self.model.config.__dict__ if hasattr(self.model, 'config') else {},
+            'config': config_dict,
             'total_params': sum(p.numel() for p in model_to_save.parameters())
         }, final_model_path)
         
