@@ -28,6 +28,19 @@ def load_config(config_path: str):
         config = yaml.safe_load(f)
     return config
 
+def is_docker_container():
+    """检测是否在Docker容器中运行"""
+    try:
+        # 检查是否存在Docker特征文件
+        return (os.path.exists('/.dockerenv') or 
+                os.path.exists('/proc/1/cgroup') and 'docker' in open('/proc/1/cgroup').read())
+    except:
+        return False
+
+def is_root_user():
+    """检测是否为root用户"""
+    return os.geteuid() == 0
+
 def auto_shutdown(delay_seconds: int = 60):
     """自动关机功能"""
     print(f"\n🔄 训练完成！将在 {delay_seconds} 秒后自动关机...")
@@ -40,17 +53,42 @@ def auto_shutdown(delay_seconds: int = 60):
         
         print(f"\n💤 正在关机...")
         
-        # 根据操作系统执行关机命令
+        # 检测环境并选择合适的关机命令
         system = platform.system().lower()
+        in_docker = is_docker_container()
+        is_root = is_root_user()
+        
+        if in_docker:
+            print("🐳 检测到Docker容器环境")
+            # 在Docker容器中，通常只能停止容器，不能关机
+            print("💡 容器环境无法直接关机，建议手动停止容器")
+            print("   可以使用: docker stop <container_id>")
+            return
+        
         if system == "windows":
             subprocess.run(["shutdown", "/s", "/t", "0"])
         elif system in ["linux", "darwin"]:  # Linux或macOS
-            subprocess.run(["sudo", "shutdown", "-h", "now"])
+            if is_root:
+                # root用户直接使用shutdown
+                subprocess.run(["shutdown", "-h", "now"])
+            else:
+                # 非root用户使用sudo
+                subprocess.run(["sudo", "shutdown", "-h", "now"])
         else:
             print("❌ 不支持的操作系统，无法自动关机")
             
     except KeyboardInterrupt:
         print(f"\n❌ 自动关机已取消")
+    except FileNotFoundError as e:
+        print(f"\n❌ 关机命令未找到: {e}")
+        print("💡 可能的解决方案:")
+        if is_docker_container():
+            print("   - Docker容器环境请手动停止容器")
+        else:
+            print("   - 确保系统支持shutdown命令")
+            print("   - 检查用户权限设置")
+    except Exception as e:
+        print(f"\n❌ 自动关机失败: {e}")
 
 def create_configs_from_yaml(yaml_config):
     """从YAML配置创建模型和训练配置"""
@@ -214,6 +252,12 @@ def main():
     total_params = calculate_model_size(model_config)
     memory_info = estimate_memory_usage(model_config, training_config)
     
+    # 打印环境信息
+    print(f"\n🌍 运行环境:")
+    print(f"操作系统: {platform.system()}")
+    print(f"Docker容器: {'是' if is_docker_container() else '否'}")
+    print(f"Root用户: {'是' if is_root_user() else '否'}")
+    
     # 打印配置信息
     print(f"\n📊 训练配置:")
     print(f"模型类型: {model_config.model_type}")
@@ -229,6 +273,8 @@ def main():
     if auto_shutdown_enabled:
         shutdown_delay = yaml_config.get('system', {}).get('shutdown_delay', 60)
         print(f"🔄 自动关机: 启用 ({shutdown_delay}秒延迟)")
+        if is_docker_container():
+            print(f"⚠️  Docker环境警告: 将显示关机提示但不会实际关机")
     else:
         print(f"🔄 自动关机: 禁用")
     
