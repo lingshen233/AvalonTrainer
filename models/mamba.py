@@ -69,6 +69,9 @@ class SelectiveSSM(nn.Module):
         """
         batch, seqlen, dim = x.shape
         
+        # 记录输入的数据类型
+        input_dtype = x.dtype
+        
         # 输入投影 -> (batch, seqlen, d_inner * 2)
         xz = self.in_proj(x)
         x, z = xz.chunk(2, dim=-1)  # (batch, seqlen, d_inner)
@@ -92,11 +95,15 @@ class SelectiveSSM(nn.Module):
         # 状态空间计算（简化版本）
         y = self.selective_scan(x, dt, self.A, B, C, self.D)
         
+        # 确保y和z的数据类型一致
+        y = y.to(dtype=input_dtype)
+        z = z.to(dtype=input_dtype)
+        
         # 门控
         y = y * F.silu(z)
         
-        # 输出投影
-        output = self.out_proj(y)
+        # 输出投影 - 确保数据类型一致
+        output = self.out_proj(y.to(dtype=input_dtype))
         
         return self.dropout(output)
     
@@ -107,8 +114,15 @@ class SelectiveSSM(nn.Module):
         batch, seqlen, d_inner = u.shape
         d_state = A.shape[1]
         
-        # 重新计算A以确保维度匹配
-        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+        # 确保所有张量使用相同的数据类型和设备
+        target_dtype = u.dtype
+        target_device = u.device
+        
+        # 重新计算A以确保维度匹配和数据类型一致
+        A = -torch.exp(self.A_log.float()).to(dtype=target_dtype, device=target_device)  # (d_inner, d_state)
+        
+        # 确保D参数的数据类型一致
+        D = self.D.to(dtype=target_dtype, device=target_device)
         
         # 离散化
         dt = dt.unsqueeze(-1)  # (batch, seqlen, d_inner, 1)
@@ -118,8 +132,8 @@ class SelectiveSSM(nn.Module):
         dA = torch.exp(dt * A)  # (batch, seqlen, d_inner, d_state)
         dB = dt * B.unsqueeze(2)  # (batch, seqlen, d_inner, d_state)
         
-        # 初始化状态
-        x = torch.zeros(batch, d_inner, d_state, device=u.device, dtype=u.dtype)
+        # 初始化状态 - 确保数据类型一致
+        x = torch.zeros(batch, d_inner, d_state, device=target_device, dtype=target_dtype)
         
         # 扫描
         ys = []
