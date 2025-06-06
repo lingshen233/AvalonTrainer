@@ -417,8 +417,31 @@ def main():
         print("🔧 运行配置修复...")
         os.system(f"python fix_deepspeed_batch_size.py --num_gpus {args.num_gpus}")
     
-    # 尝试使用预构建配置
-    ds_config = use_prebuilt_config(args.num_gpus)
+    # 修复：优先使用用户指定的deepspeed_config
+    ds_config = None
+    
+    if args.deepspeed_config and os.path.exists(args.deepspeed_config):
+        print(f"✅ 使用指定配置: {args.deepspeed_config}")
+        with open(args.deepspeed_config, 'r') as f:
+            ds_config = json.load(f)
+        
+        # 验证配置正确性
+        train_batch = ds_config.get('train_batch_size', 0)
+        micro_batch = ds_config.get('train_micro_batch_size_per_gpu', 0)
+        grad_acc = ds_config.get('gradient_accumulation_steps', 0)
+        expected = micro_batch * grad_acc * args.num_gpus
+        
+        if train_batch == expected:
+            print(f"✅ 配置验证通过: {train_batch} = {micro_batch} × {grad_acc} × {args.num_gpus}")
+        else:
+            print(f"❌ 配置验证失败: {train_batch} != {expected}")
+            print(f"🔧 将自动修复批次大小为单GPU配置...")
+            # 为单GPU修复配置
+            ds_config['train_batch_size'] = micro_batch * grad_acc * 1
+            print(f"✅ 修复完成: {ds_config['train_batch_size']} = {micro_batch} × {grad_acc} × 1")
+    else:
+        # 尝试使用预构建配置
+        ds_config = use_prebuilt_config(args.num_gpus)
     
     if ds_config is None:
         print("🔄 fallback到动态生成配置...")
@@ -488,10 +511,13 @@ def main():
             yaml_config['num_gpus'] = args.num_gpus
             model_config, training_config = create_configs_from_yaml(yaml_config)
     
-    # 保存DeepSpeed配置文件（如果不是预构建的）
-    ds_config_path = "deepspeed_config.json"
-    with open(ds_config_path, 'w') as f:
-        json.dump(ds_config, f, indent=2)
+    # 保存DeepSpeed配置文件（如果不是用户指定的）
+    if not args.deepspeed_config:
+        ds_config_path = "deepspeed_config.json"
+        with open(ds_config_path, 'w') as f:
+            json.dump(ds_config, f, indent=2)
+    else:
+        ds_config_path = args.deepspeed_config
     
     # 打印配置信息
     from configs.model_presets import calculate_model_parameters
