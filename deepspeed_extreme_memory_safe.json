@@ -1,7 +1,8 @@
 {
   "train_batch_size": 32,
   "train_micro_batch_size_per_gpu": 1,
-  "gradient_accumulation_steps": 4,
+  "gradient_accumulation_steps": 32,
+  
   "zero_optimization": {
     "stage": 3,
     "offload_optimizer": {
@@ -14,19 +15,20 @@
       "device": "cpu",
       "pin_memory": true,
       "buffer_count": 5,
-      "buffer_size": 100000000.0,
-      "max_in_cpu": 1000000000.0
+      "buffer_size": 1e8,
+      "max_in_cpu": 1e9
     },
     "overlap_comm": true,
     "contiguous_gradients": true,
-    "reduce_bucket_size": 50000000.0,
-    "stage3_prefetch_bucket_size": 50000000.0,
-    "stage3_param_persistence_threshold": 1000000.0,
-    "sub_group_size": 1000000000.0,
-    "stage3_max_live_parameters": 1000000000.0,
-    "stage3_max_reuse_distance": 1000000000.0,
+    "reduce_bucket_size": 5e7,
+    "stage3_prefetch_bucket_size": 5e7,
+    "stage3_param_persistence_threshold": 1e6,
+    "sub_group_size": 1e9,
+    "stage3_max_live_parameters": 1e9,
+    "stage3_max_reuse_distance": 1e9,
     "stage3_gather_16bit_weights_on_model_save": true
   },
+  
   "fp16": {
     "enabled": true,
     "loss_scale": 0,
@@ -35,29 +37,30 @@
     "hysteresis": 2,
     "min_loss_scale": 1
   },
+  
   "optimizer": {
     "type": "AdamW",
     "params": {
-      "lr": 5e-05,
-      "betas": [
-        0.9,
-        0.95
-      ],
-      "eps": 1e-08,
+      "lr": 5e-5,
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
       "weight_decay": 0.01
     }
   },
+  
   "scheduler": {
     "type": "WarmupLR",
     "params": {
       "warmup_min_lr": 0,
-      "warmup_max_lr": 5e-05,
+      "warmup_max_lr": 5e-5,
       "warmup_num_steps": 1000
     }
   },
+  
   "gradient_clipping": 1.0,
   "steps_per_print": 10,
   "wall_clock_breakdown": false,
+  
   "activation_checkpointing": {
     "partition_activations": true,
     "cpu_checkpointing": true,
@@ -66,11 +69,14 @@
     "synchronize_checkpoint_boundary": true,
     "profile": false
   },
+  
   "comms_logger": {
     "enabled": false
   },
+  
   "memory_breakdown": false,
+  
   "flops_profiler": {
     "enabled": false
   }
-}
+} 

@@ -193,20 +193,135 @@ def generate_correct_configs():
     print("\n📝 生成标准配置文件...")
     
     configs = [
-        {"gpus": 1, "micro": 2, "grad_acc": 16, "name": "deepspeed_1gpu.json"},
-        {"gpus": 2, "micro": 2, "grad_acc": 16, "name": "deepspeed_2gpu.json"},
-        {"gpus": 4, "micro": 4, "grad_acc": 8, "name": "deepspeed_4gpu.json"},
-        {"gpus": 8, "micro": 4, "grad_acc": 4, "name": "deepspeed_8gpu.json"},
+        {"gpus": 1, "micro": 1, "grad_acc": 32, "name": "deepspeed_1gpu.json"},
+        {"gpus": 2, "micro": 1, "grad_acc": 16, "name": "deepspeed_2gpu.json"},
+        {"gpus": 4, "micro": 1, "grad_acc": 8, "name": "deepspeed_4gpu.json"},
+        {"gpus": 6, "micro": 1, "grad_acc": 8, "name": "deepspeed_6gpu.json"},
+        {"gpus": 8, "micro": 1, "grad_acc": 4, "name": "deepspeed_8gpu.json"},
     ]
     
     for cfg in configs:
         print(f"\n   生成 {cfg['gpus']}GPU 配置: {cfg['name']}")
-        fix_deepspeed_config(
-            config_file=cfg['name'],
-            num_gpus=cfg['gpus'],
-            micro_batch=cfg['micro'],
-            grad_acc=cfg['grad_acc']
-        )
+        
+        # 对于6GPU及以上，使用极限优化配置
+        if cfg['gpus'] >= 6:
+            create_extreme_memory_config(
+                config_file=cfg['name'],
+                num_gpus=cfg['gpus'],
+                micro_batch=cfg['micro'],
+                grad_acc=cfg['grad_acc']
+            )
+        else:
+            fix_deepspeed_config(
+                config_file=cfg['name'],
+                num_gpus=cfg['gpus'],
+                micro_batch=cfg['micro'],
+                grad_acc=cfg['grad_acc']
+            )
+
+def create_extreme_memory_config(config_file, num_gpus, micro_batch=1, grad_acc=8):
+    """创建极限显存优化配置（ZeRO-3 + CPU卸载）"""
+    
+    print(f"🔧 创建极限显存优化配置: {config_file}")
+    print(f"   GPU数量: {num_gpus}")
+    print(f"   micro_batch_per_gpu: {micro_batch}")
+    print(f"   gradient_accumulation_steps: {grad_acc}")
+    
+    # 计算正确的train_batch_size
+    correct_train_batch_size = micro_batch * grad_acc * num_gpus
+    
+    print(f"   计算train_batch_size: {micro_batch} × {grad_acc} × {num_gpus} = {correct_train_batch_size}")
+    
+    # 创建极限优化配置
+    config = {
+        "train_batch_size": correct_train_batch_size,
+        "train_micro_batch_size_per_gpu": micro_batch,
+        "gradient_accumulation_steps": grad_acc,
+        
+        # ZeRO-3 + 激进CPU卸载
+        "zero_optimization": {
+            "stage": 3,
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True,
+                "buffer_count": 4,
+                "fast_init": False
+            },
+            "offload_param": {
+                "device": "cpu", 
+                "pin_memory": True,
+                "buffer_count": 5,
+                "buffer_size": 1e8,
+                "max_in_cpu": 1e9
+            },
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_bucket_size": 5e7,
+            "stage3_prefetch_bucket_size": 5e7,
+            "stage3_param_persistence_threshold": 1e6,
+            "sub_group_size": 1e9,
+            "stage3_max_live_parameters": 1e9,
+            "stage3_max_reuse_distance": 1e9,
+            "stage3_gather_16bit_weights_on_model_save": True
+        },
+        
+        "fp16": {
+            "enabled": True,
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "initial_scale_power": 16,
+            "hysteresis": 2,
+            "min_loss_scale": 1
+        },
+        
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": 5e-5,
+                "betas": [0.9, 0.95],
+                "eps": 1e-8,
+                "weight_decay": 0.01
+            }
+        },
+        
+        "scheduler": {
+            "type": "WarmupLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": 5e-5,
+                "warmup_num_steps": 1000
+            }
+        },
+        
+        "gradient_clipping": 1.0,
+        "steps_per_print": 10,
+        "wall_clock_breakdown": False,
+        
+        # 激进的激活检查点
+        "activation_checkpointing": {
+            "partition_activations": True,
+            "cpu_checkpointing": True,
+            "contiguous_memory_optimization": True,
+            "number_checkpoints": 16,
+            "synchronize_checkpoint_boundary": True,
+            "profile": False
+        },
+        
+        "comms_logger": {"enabled": False},
+        "memory_breakdown": False,
+        "flops_profiler": {"enabled": False}
+    }
+    
+    # 保存配置
+    with open(config_file, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    print(f"✅ 极限优化配置已创建: {config_file}")
+    
+    # 验证配置
+    verify_config(config_file, num_gpus)
+    
+    return config
 
 def main():
     parser = argparse.ArgumentParser(description="修复DeepSpeed批次大小配置")
