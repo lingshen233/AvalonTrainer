@@ -109,7 +109,8 @@ class SelectiveSSM(nn.Module):
     
     def selective_scan(self, u, dt, A, B, C, D):
         """
-        选择性扫描算法（简化版本）
+        选择性扫描算法（内存优化版本）
+        使用分块计算减少显存占用
         """
         batch, seqlen, d_inner = u.shape
         d_state = A.shape[1]
@@ -124,29 +125,53 @@ class SelectiveSSM(nn.Module):
         # 确保D参数的数据类型一致
         D = self.D.to(dtype=target_dtype, device=target_device)
         
-        # 离散化
-        dt = dt.unsqueeze(-1)  # (batch, seqlen, d_inner, 1)
-        A = A.unsqueeze(0).unsqueeze(0)  # (1, 1, d_inner, d_state)
-        
-        # 计算离散化参数
-        dA = torch.exp(dt * A)  # (batch, seqlen, d_inner, d_state)
-        dB = dt * B.unsqueeze(2)  # (batch, seqlen, d_inner, d_state)
-        
         # 初始化状态 - 确保数据类型一致
         x = torch.zeros(batch, d_inner, d_state, device=target_device, dtype=target_dtype)
         
-        # 扫描
+        # 使用分块计算，减少显存峰值
+        chunk_size = min(32, seqlen)  # 每次处理32个时间步
         ys = []
-        for i in range(seqlen):
-            # 更新状态 - 修复维度匹配问题
-            u_i = u[:, i].unsqueeze(-1)  # (batch, d_inner, 1)
-            x = dA[:, i] * x + dB[:, i] * u_i  # 正确的维度匹配
+        
+        for chunk_start in range(0, seqlen, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seqlen)
+            chunk_len = chunk_end - chunk_start
             
-            # 输出
-            C_i = C[:, i].unsqueeze(1)  # (batch, 1, d_state)
-            y = torch.sum(x * C_i, dim=-1)  # (batch, d_inner)
-            y = y + D * u[:, i]
-            ys.append(y)
+            # 获取当前块的数据
+            u_chunk = u[:, chunk_start:chunk_end]  # (batch, chunk_len, d_inner)
+            dt_chunk = dt[:, chunk_start:chunk_end]  # (batch, chunk_len, d_inner)
+            B_chunk = B[:, chunk_start:chunk_end]  # (batch, chunk_len, d_state)
+            C_chunk = C[:, chunk_start:chunk_end]  # (batch, chunk_len, d_state)
+            
+            # 分步计算，避免大张量
+            chunk_ys = []
+            for i in range(chunk_len):
+                # 当前时间步的参数
+                dt_i = dt_chunk[:, i].unsqueeze(-1)  # (batch, d_inner, 1)
+                u_i = u_chunk[:, i]  # (batch, d_inner)
+                B_i = B_chunk[:, i].unsqueeze(1)  # (batch, 1, d_state)
+                C_i = C_chunk[:, i].unsqueeze(1)  # (batch, 1, d_state)
+                
+                # 离散化参数（逐步计算）
+                A_expanded = A.unsqueeze(0)  # (1, d_inner, d_state)
+                dA_i = torch.exp(dt_i * A_expanded)  # (batch, d_inner, d_state)
+                dB_i = dt_i * B_i  # (batch, d_inner, d_state)
+                
+                # 状态更新
+                u_i_expanded = u_i.unsqueeze(-1)  # (batch, d_inner, 1)
+                x = dA_i * x + dB_i * u_i_expanded  # (batch, d_inner, d_state)
+                
+                # 输出计算
+                y_i = torch.sum(x * C_i, dim=-1)  # (batch, d_inner)
+                y_i = y_i + D * u_i  # (batch, d_inner)
+                
+                chunk_ys.append(y_i)
+                
+                # 清理中间变量
+                del dA_i, dB_i, u_i_expanded
+                torch.cuda.empty_cache()
+            
+            # 收集当前块的结果
+            ys.extend(chunk_ys)
         
         return torch.stack(ys, dim=1)  # (batch, seqlen, d_inner)
 
