@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
 """
-DeepSpeed ZeRO优化版训练脚本 - 支持真正的7B模型
-使用ZeRO-2优化，将参数和优化器状态分片到多个GPU
+DeepSpeed ZeRO优化训练脚本 - 修复版
+解决批次大小配置问题
 """
 
 import os
-import sys
-import argparse
+import json
 import yaml
 import torch
 import torch.nn as nn
-import time
-import subprocess
-import platform
-import gc
-import json
-from pathlib import Path
+import argparse
+import shutil
 
-# DeepSpeed相关导入
+# DeepSpeed导入
 try:
     import deepspeed
-    from deepspeed.ops.adam import FusedAdam
     DEEPSPEED_AVAILABLE = True
-    print("✅ DeepSpeed已安装")
 except ImportError:
     DEEPSPEED_AVAILABLE = False
     print("❌ DeepSpeed未安装，将使用标准训练")
@@ -33,20 +26,24 @@ def clear_gpu_memory():
         for i in range(torch.cuda.device_count()):
             torch.cuda.set_device(i)
             torch.cuda.empty_cache()
-        gc.collect()
-        print("🧹 已清理所有GPU缓存")
 
 def load_config(config_path: str):
-    """加载配置文件"""
+    """加载YAML配置文件"""
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
 def create_deepspeed_config(model_config, training_config, num_gpus):
     """创建DeepSpeed配置"""
+    # 计算正确的批次大小关系：
+    # train_batch_size = micro_batch_per_gpu * gradient_accumulation_steps * world_size
+    micro_batch_per_gpu = training_config.train_batch_size
+    gradient_accumulation_steps = training_config.gradient_accumulation_steps
+    train_batch_size = micro_batch_per_gpu * gradient_accumulation_steps * num_gpus
+    
     ds_config = {
-        "train_batch_size": training_config.train_batch_size * num_gpus,
-        "train_micro_batch_size_per_gpu": training_config.train_batch_size,
-        "gradient_accumulation_steps": training_config.gradient_accumulation_steps,
+        "train_batch_size": train_batch_size,
+        "train_micro_batch_size_per_gpu": micro_batch_per_gpu,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
         
         # 启用ZeRO-2优化
         "zero_optimization": {
@@ -56,7 +53,9 @@ def create_deepspeed_config(model_config, training_config, num_gpus):
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
             "allgather_bucket_size": 5e8,
-            "cpu_offload": False  # Mamba模型不适合CPU卸载
+            "offload_optimizer": {
+                "device": "none"  # 不使用CPU卸载，Mamba模型不适合
+            }
         },
         
         # 混合精度
@@ -107,6 +106,32 @@ def create_deepspeed_config(model_config, training_config, num_gpus):
     }
     
     return ds_config
+
+def use_prebuilt_config(num_gpus):
+    """使用预先构建的正确配置"""
+    config_file = f"deepspeed_{num_gpus}gpu.json"
+    
+    if os.path.exists(config_file):
+        print(f"✅ 使用预构建配置: {config_file}")
+        
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        # 验证配置正确性
+        train_batch = config.get('train_batch_size', 0)
+        micro_batch = config.get('train_micro_batch_size_per_gpu', 0)
+        grad_acc = config.get('gradient_accumulation_steps', 0)
+        expected = micro_batch * grad_acc * num_gpus
+        
+        if train_batch == expected:
+            print(f"✅ 配置验证通过: {train_batch} = {micro_batch} × {grad_acc} × {num_gpus}")
+            return config
+        else:
+            print(f"❌ 配置验证失败: {train_batch} != {expected}")
+            return None
+    else:
+        print(f"⚠️ 未找到预构建配置: {config_file}")
+        return None
 
 def create_configs_from_yaml(yaml_config):
     """从YAML配置创建模型和训练配置"""
@@ -188,12 +213,16 @@ class DeepSpeedTrainer:
         print("📦 创建模型...")
         model = create_model(self.model_config.model_type, self.model_config)
         
-        # 计算参数量
-        total_params = sum(p.numel() for p in model.parameters())
+        # 使用正确的参数量计算函数
+        from configs.model_presets import calculate_model_parameters
+        estimated_params = calculate_model_parameters(self.model_config)
+        
+        # 实际参数量（用于验证）
+        actual_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         
         if self.local_rank == 0:
-            print(f"模型参数: {total_params:,} ({total_params/1e9:.2f}B)")
+            print(f"模型参数: {actual_params:,} ({actual_params/1e9:.2f}B)")
             print(f"可训练参数: {trainable_params:,} ({trainable_params/1e9:.2f}B)")
         
         return model
@@ -349,7 +378,7 @@ class DeepSpeedTrainer:
             print("✅ DeepSpeed训练完成！")
 
 def main():
-    parser = argparse.ArgumentParser(description="DeepSpeed ZeRO优化训练脚本")
+    parser = argparse.ArgumentParser(description="DeepSpeed ZeRO优化训练脚本 - 修复版")
     
     # 基本参数
     parser.add_argument("--config", type=str, default="config_7b_mamba.yaml", help="配置文件路径")
@@ -363,6 +392,7 @@ def main():
     # 系统参数
     parser.add_argument("--dry_run", action="store_true", help="只验证配置")
     parser.add_argument("--check_memory", action="store_true", help="检查显存使用")
+    parser.add_argument("--fix_config", action="store_true", help="自动修复配置问题")
     
     args = parser.parse_args()
     
@@ -382,61 +412,83 @@ def main():
                 print(f"GPU {i}: {props.name} - {total:.1f}GB")
         return
     
-    # 处理预设配置
-    if args.preset:
-        from configs.model_presets import get_model_preset, get_training_config_for_model_size
+    # 自动修复配置
+    if args.fix_config:
+        print("🔧 运行配置修复...")
+        os.system(f"python fix_deepspeed_batch_size.py --num_gpus {args.num_gpus}")
+    
+    # 尝试使用预构建配置
+    ds_config = use_prebuilt_config(args.num_gpus)
+    
+    if ds_config is None:
+        print("🔄 fallback到动态生成配置...")
         
-        preset_config = get_model_preset(args.preset)
-        model_config = preset_config['model']
-        training_config = get_training_config_for_model_size(args.preset, args.num_gpus)
-        
-        print(f"✅ 使用预设: {preset_config['description']}")
-        print(f"   参数量: {preset_config['params']}")
-        
-        # 创建虚拟yaml配置
-        yaml_config = {
-            'model_type': model_config.model_type,
-            'num_gpus': args.num_gpus,
-            'model': {
-                'vocab_size': model_config.vocab_size,
-                'max_seq_length': model_config.max_seq_length,
-                'd_model': model_config.d_model,
-                'n_layers': model_config.n_layers,
-                'd_state': getattr(model_config, 'd_state', 16),
-                'd_conv': getattr(model_config, 'd_conv', 4),
-                'expand': getattr(model_config, 'expand', 2),
-                'dropout': model_config.dropout
-            },
-            'training': {
-                'batch_size': training_config.train_batch_size,
-                'gradient_accumulation_steps': training_config.gradient_accumulation_steps,
-                'max_length': training_config.max_length,
-                'learning_rate': training_config.learning_rate,
-                'max_steps': training_config.max_steps,
-                'warmup_steps': training_config.warmup_steps,
-                'save_steps': training_config.save_steps,
-                'logging_steps': training_config.logging_steps,
-                'fp16': training_config.fp16,
-                'output_dir': training_config.output_dir,
-                'checkpoint_dir': training_config.checkpoint_dir
+        # 处理预设配置
+        if args.preset:
+            from configs.model_presets import get_model_preset, get_training_config_for_model_size
+            
+            preset_config = get_model_preset(args.preset)
+            model_config = preset_config['model']
+            training_config = get_training_config_for_model_size(args.preset, args.num_gpus)
+            
+            print(f"✅ 使用预设: {preset_config['description']}")
+            print(f"   参数量: {preset_config['params']}")
+            
+            # 创建虚拟yaml配置
+            yaml_config = {
+                'model_type': model_config.model_type,
+                'num_gpus': args.num_gpus,
+                'model': {
+                    'vocab_size': model_config.vocab_size,
+                    'max_seq_length': model_config.max_seq_length,
+                    'd_model': model_config.d_model,
+                    'n_layers': model_config.n_layers,
+                    'd_state': getattr(model_config, 'd_state', 16),
+                    'd_conv': getattr(model_config, 'd_conv', 4),
+                    'expand': getattr(model_config, 'expand', 2),
+                    'dropout': model_config.dropout
+                },
+                'training': {
+                    'batch_size': training_config.train_batch_size,
+                    'gradient_accumulation_steps': training_config.gradient_accumulation_steps,
+                    'max_length': training_config.max_length,
+                    'learning_rate': training_config.learning_rate,
+                    'max_steps': training_config.max_steps,
+                    'warmup_steps': training_config.warmup_steps,
+                    'save_steps': training_config.save_steps,
+                    'logging_steps': training_config.logging_steps,
+                    'fp16': training_config.fp16,
+                    'output_dir': training_config.output_dir,
+                    'checkpoint_dir': training_config.checkpoint_dir
+                }
             }
-        }
-    else:
-        # 加载配置文件
-        if not os.path.exists(args.config):
-            print(f"❌ 配置文件不存在: {args.config}")
-            return
+        else:
+            # 加载配置文件
+            if not os.path.exists(args.config):
+                print(f"❌ 配置文件不存在: {args.config}")
+                return
+            
+            yaml_config = load_config(args.config)
+            yaml_config['num_gpus'] = args.num_gpus
         
-        yaml_config = load_config(args.config)
-        yaml_config['num_gpus'] = args.num_gpus
+        # 创建配置对象
+        model_config, training_config = create_configs_from_yaml(yaml_config)
+        
+        # 创建DeepSpeed配置
+        ds_config = create_deepspeed_config(model_config, training_config, args.num_gpus)
+    else:
+        # 使用预构建配置，需要创建对应的model_config
+        if args.preset:
+            from configs.model_presets import get_model_preset, get_training_config_for_model_size
+            preset_config = get_model_preset(args.preset)
+            model_config = preset_config['model']
+            training_config = get_training_config_for_model_size(args.preset, args.num_gpus)
+        else:
+            yaml_config = load_config(args.config)
+            yaml_config['num_gpus'] = args.num_gpus
+            model_config, training_config = create_configs_from_yaml(yaml_config)
     
-    # 创建配置对象
-    model_config, training_config = create_configs_from_yaml(yaml_config)
-    
-    # 创建DeepSpeed配置
-    ds_config = create_deepspeed_config(model_config, training_config, args.num_gpus)
-    
-    # 保存DeepSpeed配置文件
+    # 保存DeepSpeed配置文件（如果不是预构建的）
     ds_config_path = "deepspeed_config.json"
     with open(ds_config_path, 'w') as f:
         json.dump(ds_config, f, indent=2)
@@ -445,15 +497,32 @@ def main():
     from configs.model_presets import calculate_model_parameters
     total_params = calculate_model_parameters(model_config)
     
+    # 计算批次大小详情
+    micro_batch = ds_config['train_micro_batch_size_per_gpu']
+    grad_acc = ds_config['gradient_accumulation_steps']
+    world_size = args.num_gpus
+    train_batch = ds_config['train_batch_size']
+    
     print(f"\n📊 DeepSpeed训练配置:")
     print(f"模型类型: {model_config.model_type}")
     print(f"估算参数: {total_params/1e9:.2f}B")
     print(f"GPU数量: {args.num_gpus}")
-    print(f"批大小/GPU: {training_config.train_batch_size}")
-    print(f"梯度累积: {training_config.gradient_accumulation_steps}")
-    print(f"有效批大小: {training_config.train_batch_size * args.num_gpus * training_config.gradient_accumulation_steps}")
+    print(f"批大小/GPU: {micro_batch}")
+    print(f"梯度累积: {grad_acc}")
+    print(f"有效批大小: {train_batch}")
     print(f"ZeRO阶段: {ds_config['zero_optimization']['stage']}")
     print(f"DeepSpeed配置: {ds_config_path}")
+    
+    # 强制验证批次大小计算
+    expected = micro_batch * grad_acc * world_size
+    if train_batch != expected:
+        print(f"\n❌ 致命错误: 批次大小不匹配")
+        print(f"   train_batch_size: {train_batch}")
+        print(f"   expected: {micro_batch} × {grad_acc} × {world_size} = {expected}")
+        print(f"🔧 请运行: python fix_deepspeed_batch_size.py --num_gpus {args.num_gpus}")
+        return
+    else:
+        print(f"\n✅ 批次大小验证通过: {train_batch} = {micro_batch} × {grad_acc} × {world_size}")
     
     if args.dry_run:
         print("\n✅ 配置验证完成（dry_run模式）")
@@ -468,6 +537,10 @@ def main():
         print(f"❌ 训练失败: {e}")
         import traceback
         traceback.print_exc()
+        
+        # 自动运行修复建议
+        print(f"\n🔧 建议运行修复命令:")
+        print(f"python fix_deepspeed_batch_size.py --num_gpus {args.num_gpus}")
 
 if __name__ == "__main__":
     main() 
