@@ -1,0 +1,67 @@
+# 多GPU训练配置文件
+# 使用方法: python train.py --config config.yaml
+
+# 基础设置
+model_type: "mamba"  # transformer 或 mamba
+num_gpus: 1          # 使用的GPU数量，1=单GPU，>1=多GPU训练
+
+# 模型配置
+model:
+  vocab_size: 50257
+  max_seq_length: 2048
+  d_model: 1536       # 模型维度
+  n_layers: 24        # 层数
+  dropout: 0.1
+  
+  # Transformer专用参数
+  n_heads: 16         # 注意力头数
+  d_ff: 6144         # 前馈网络维度
+  
+  # Mamba专用参数  
+  d_state: 16        # 状态维度
+  d_conv: 4          # 卷积核大小
+  expand: 2          # 扩展因子
+
+# 训练配置
+training:
+  # 数据和批次
+  dataset: "wikitext"
+  batch_size: null     # null表示自动计算，或手动设置如8
+  gradient_accumulation_steps: 4
+  max_length: 2048
+  
+  # 优化器
+  learning_rate: 3e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  
+  # 训练步数
+  max_steps: 50000
+  warmup_steps: 2000
+  
+  # 评估和保存
+  eval_steps: 1000
+  save_steps: 5000
+  logging_steps: 100
+  
+  # 技术选项
+  fp16: true
+  
+  # 路径
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  
+  # 监控
+  use_wandb: true
+  wandb_project: "multi-gpu-training"
+  run_name: null       # null表示自动生成
+
+# GPU配置
+gpu:
+  auto_batch_size: true    # 自动调整批大小以适应显存
+  memory_fraction: 0.9     # 使用显存的比例 
+
+# 系统配置
+system:
+  auto_shutdown: false     # 训练完成后自动关机
+  shutdown_delay: 60       # 关机前等待时间（秒） 
