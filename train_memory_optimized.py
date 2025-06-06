@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-显存优化版多GPU训练脚本
-专门针对大模型和有限显存的情况
+显存优化版单机多GPU训练脚本
+取消分布式训练，使用DataParallel，节省显存
 """
 
 import os
@@ -9,191 +9,306 @@ import sys
 import argparse
 import yaml
 import torch
-import torch.multiprocessing as mp
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.nn as nn
+from torch.nn import DataParallel
 import time
 import subprocess
 import platform
 import gc
+from pathlib import Path
 
 def clear_gpu_memory():
     """清理GPU显存"""
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.set_device(i)
+            torch.cuda.empty_cache()
         gc.collect()
+        print("🧹 已清理所有GPU缓存")
 
-def setup_ddp(rank: int, world_size: int):
-    """设置分布式训练"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12356'  # 使用不同端口避免冲突
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-
-def cleanup_ddp():
-    """清理分布式训练"""
-    destroy_process_group()
-
-def check_available_memory(device):
-    """检查可用显存"""
-    if torch.cuda.is_available():
-        total = torch.cuda.get_device_properties(device).total_memory / 1e9
-        allocated = torch.cuda.memory_allocated(device) / 1e9
-        reserved = torch.cuda.memory_reserved(device) / 1e9
-        free = total - reserved
-        return free, total
-    return 0, 0
-
-def train_worker_optimized(rank: int, world_size: int, config_path: str):
-    """显存优化的训练工作进程"""
-    
-    # 设置分布式
-    if world_size > 1:
-        setup_ddp(rank, world_size)
-    
-    # 设置设备
-    device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
-    
-    # 在每个进程开始前清理显存
-    clear_gpu_memory()
-    
-    # 检查可用显存
-    free_mem, total_mem = check_available_memory(rank)
-    if rank == 0:
-        print(f"GPU {rank}: 可用显存 {free_mem:.2f}GB / 总显存 {total_mem:.2f}GB")
-    
-    # 加载配置
+def load_config(config_path: str):
+    """加载配置文件"""
     with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    
-    # 导入必要的模块
-    from configs.base import ModelConfig
-    from models import create_model
-    
-    # 创建模型配置
-    model_config = ModelConfig(
-        model_type=config['model_type'],
-        vocab_size=config['model']['vocab_size'],
-        max_seq_length=config['model']['max_seq_length'],
-        d_model=config['model']['d_model'],
-        n_layers=config['model']['n_layers'],
-        n_heads=config['model']['n_heads'],
-        d_ff=config['model']['d_ff'],
-        dropout=config['model']['dropout']
-    )
-    
-    # 创建模型
-    print(f"GPU {rank}: 创建模型...")
-    model = create_model(model_config.model_type, model_config)
-    
-    # 启用梯度检查点（如果配置启用）
-    if config.get('optimization', {}).get('gradient_checkpointing', False):
-        print(f"GPU {rank}: 启用梯度检查点")
-        if hasattr(model, 'gradient_checkpointing_enable'):
-            model.gradient_checkpointing_enable()
-    
-    # 检查模型创建后的显存
-    model_mem_before = torch.cuda.memory_allocated(rank) / 1e9 if torch.cuda.is_available() else 0
-    if rank == 0:
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"模型参数量: {total_params:,} ({total_params/1e9:.2f}B)")
-        print(f"模型创建后显存使用: {model_mem_before:.2f}GB")
-    
-    # 移动模型到GPU（分批进行以减少显存峰值）
-    print(f"GPU {rank}: 移动模型到设备...")
+        return yaml.safe_load(f)
+
+def is_docker_container():
+    """检查是否在Docker容器中"""
     try:
-        # 逐层移动模型以减少显存峰值
-        if hasattr(model, 'transformer'):
-            # Transformer模型
-            model.transformer.wte = model.transformer.wte.to(device)
-            model.transformer.wpe = model.transformer.wpe.to(device)
-            
-            for i, layer in enumerate(model.transformer.h):
-                layer = layer.to(device)
-                if i % 4 == 0:  # 每4层清理一次缓存
-                    clear_gpu_memory()
-            
-            model.transformer.ln_f = model.transformer.ln_f.to(device)
-            model.lm_head = model.lm_head.to(device)
-        else:
-            # 其他模型类型直接移动
-            model = model.to(device)
-            
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"GPU {rank}: 显存不足 - {e}")
-        # 尝试清理并重试
-        clear_gpu_memory()
-        print(f"GPU {rank}: 清理缓存后重试...")
+        with open('/proc/1/cgroup', 'r') as f:
+            return 'docker' in f.read()
+    except:
+        return False
+
+def is_root_user():
+    """检查是否为root用户"""
+    return os.getuid() == 0 if hasattr(os, 'getuid') else False
+
+def auto_shutdown(delay_seconds: int = 60):
+    """自动关机功能"""
+    is_docker = is_docker_container()
+    is_root = is_root_user()
+    
+    if not is_docker and not is_root:
+        print(f"⚠️ 非Docker环境且非root用户，无法执行关机命令")
+        return
+    
+    print(f"🔄 {delay_seconds}秒后自动关机...")
+    
+    for remaining in range(delay_seconds, 0, -1):
+        print(f"⏳ 倒计时: {remaining}秒 (Ctrl+C取消)")
         try:
-            model = model.to(device)
-        except torch.cuda.OutOfMemoryError:
-            print(f"GPU {rank}: 显存仍然不足，请减小模型规模或批大小")
+            time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n🚫 用户取消自动关机")
             return
     
-    # 检查模型移动后的显存
-    model_mem_after = torch.cuda.memory_allocated(rank) / 1e9 if torch.cuda.is_available() else 0
-    if rank == 0:
-        print(f"模型移动后显存使用: {model_mem_after:.2f}GB")
-    
-    # 包装为DDP
-    if world_size > 1:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-    
-    # 简化的训练循环（演示）
-    print(f"GPU {rank}: 开始训练...")
-    
-    # 创建虚拟批次数据进行测试
-    batch_size = config['training']['batch_size']
-    seq_length = config['training']['max_length']
-    
+    print("🔌 执行关机命令...")
     try:
-        # 测试前向传播
-        dummy_input = torch.randint(0, model_config.vocab_size, (batch_size, seq_length)).to(device)
-        
-        with torch.cuda.amp.autocast(enabled=config['training']['fp16']):
-            output = model(dummy_input)
-        
-        if rank == 0:
-            forward_mem = torch.cuda.memory_allocated(rank) / 1e9
-            print(f"前向传播后显存: {forward_mem:.2f}GB")
-            print(f"✅ 前向传播成功，输出形状: {output.logits.shape if hasattr(output, 'logits') else output.shape}")
-            
-            # 保存简单的模型检查点
-            os.makedirs(config['training']['checkpoint_dir'], exist_ok=True)
-            checkpoint_path = os.path.join(config['training']['checkpoint_dir'], "test_model.pt")
-            torch.save({
-                'model_state_dict': model.module.state_dict() if world_size > 1 else model.state_dict(),
-                'config': model_config.__dict__,
-                'rank': rank
-            }, checkpoint_path)
-            print(f"✅ 测试模型已保存至: {checkpoint_path}")
-            
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"GPU {rank}: 前向传播显存不足 - {e}")
-        print(f"建议: 减小batch_size或max_length")
+        if is_docker:
+            subprocess.run(['halt'], check=True)
+        else:
+            subprocess.run(['shutdown', '-h', 'now'], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ 关机命令执行失败: {e}")
+    except FileNotFoundError:
+        print("❌ 关机命令未找到")
+
+def create_configs_from_yaml(yaml_config):
+    """从YAML配置创建模型和训练配置"""
+    from configs.base import ModelConfig, TrainingConfig
     
-    # 清理
-    if world_size > 1:
-        cleanup_ddp()
-    clear_gpu_memory()
+    # 创建模型配置
+    model_params = yaml_config.get('model', {})
+    model_config = ModelConfig(
+        model_type=yaml_config.get('model_type', 'transformer'),
+        vocab_size=model_params.get('vocab_size', 50257),
+        max_seq_length=model_params.get('max_seq_length', 2048),
+        d_model=model_params.get('d_model', 768),
+        n_layers=model_params.get('n_layers', 12),
+        n_heads=model_params.get('n_heads', 12),
+        d_ff=model_params.get('d_ff', 3072),
+        dropout=model_params.get('dropout', 0.1),
+        # Mamba特有参数
+        d_state=model_params.get('d_state', 16),
+        d_conv=model_params.get('d_conv', 4),
+        expand=model_params.get('expand', 2)
+    )
+    
+    # 创建训练配置
+    training_params = yaml_config.get('training', {})
+    training_config = TrainingConfig(
+        dataset_name=training_params.get('dataset', 'auto'),
+        train_batch_size=training_params.get('batch_size', 4),
+        eval_batch_size=training_params.get('eval_batch_size', 4),
+        gradient_accumulation_steps=training_params.get('gradient_accumulation_steps', 1),
+        max_length=training_params.get('max_length', 512),
+        learning_rate=training_params.get('learning_rate', 5e-5),
+        weight_decay=training_params.get('weight_decay', 0.01),
+        max_grad_norm=training_params.get('max_grad_norm', 1.0),
+        max_steps=training_params.get('max_steps', 10000),
+        warmup_steps=training_params.get('warmup_steps', 1000),
+        eval_steps=training_params.get('eval_steps', 500),
+        save_steps=training_params.get('save_steps', 1000),
+        logging_steps=training_params.get('logging_steps', 100),
+        fp16=training_params.get('fp16', True),
+        output_dir=training_params.get('output_dir', './outputs'),
+        checkpoint_dir=training_params.get('checkpoint_dir', './checkpoints'),
+        use_wandb=training_params.get('use_wandb', False),
+        wandb_project=training_params.get('wandb_project', 'rag-transformer'),
+        wandb_run_name=training_params.get('wandb_run_name', 'run'),
+        distributed=False,  # 单机多卡不使用分布式
+        world_size=1
+    )
+    
+    return model_config, training_config
+
+def calculate_model_size(model_config):
+    """计算模型参数量"""
+    if model_config.model_type == 'transformer':
+        # Transformer参数估算
+        embedding_params = model_config.vocab_size * model_config.d_model
+        attention_params = 4 * model_config.d_model * model_config.d_model
+        ffn_params = 2 * model_config.d_model * model_config.d_ff
+        layer_params = attention_params + ffn_params
+        total_params = embedding_params + model_config.n_layers * layer_params
+    elif model_config.model_type == 'mamba':
+        # Mamba参数估算
+        embedding_params = model_config.vocab_size * model_config.d_model
+        layer_params = model_config.d_model * model_config.d_model * model_config.expand * 2
+        layer_params += model_config.d_state * model_config.d_model
+        total_params = embedding_params + model_config.n_layers * layer_params
+    else:
+        total_params = 0
+    
+    return total_params
+
+def estimate_memory_usage(model_config, training_config):
+    """估算显存使用"""
+    params = calculate_model_size(model_config)
+    
+    # 基础模型显存 (FP16)
+    model_memory = params * 2 / 1e9  # 2 bytes per parameter
+    
+    # 优化器状态 (Adam: 8 bytes per parameter)
+    optimizer_memory = params * 8 / 1e9
+    
+    # 梯度 (FP16)
+    gradient_memory = params * 2 / 1e9
+    
+    # 激活值估算 (batch_size * seq_length * d_model * layers)
+    activation_memory = (training_config.train_batch_size * 
+                        training_config.max_length * 
+                        model_config.d_model * 
+                        model_config.n_layers * 2) / 1e9
+    
+    total_memory = model_memory + optimizer_memory + gradient_memory + activation_memory
+    
+    return {
+        'model_memory_gb': model_memory,
+        'optimizer_memory_gb': optimizer_memory,
+        'gradient_memory_gb': gradient_memory,
+        'activation_memory_gb': activation_memory,
+        'total_memory_gb': total_memory
+    }
+
+def list_available_configs():
+    """列出可用的模型配置"""
+    return {
+        'transformer': 'Transformer模型 - 标准注意力机制',
+        'mamba': 'Mamba模型 - 状态空间模型'
+    }
+
+class OptimizedTrainer:
+    """优化的单机多GPU训练器"""
+    
+    def __init__(self, model, config, device_count):
+        self.model = model
+        self.config = config
+        self.device_count = device_count
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        
+        # 创建输出目录
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        
+        print(f"💾 训练器初始化完成")
+        print(f"   使用设备: {self.device}")
+        print(f"   GPU数量: {self.device_count}")
+        print(f"   输出目录: {os.path.abspath(self.config.output_dir)}")
+        print(f"   检查点目录: {os.path.abspath(self.config.checkpoint_dir)}")
+    
+    def train(self):
+        """训练循环"""
+        print("🚀 开始训练...")
+        
+        # 简化的训练循环（演示）
+        for step in range(1, min(self.config.max_steps + 1, 100)):  # 限制步数用于测试
+            try:
+                # 创建虚拟批次数据
+                batch_size = self.config.train_batch_size
+                seq_length = self.config.max_length
+                
+                # 生成随机输入数据
+                input_ids = torch.randint(0, 50257, (batch_size, seq_length))
+                
+                # 移动到设备
+                input_ids = input_ids.to(self.device)
+                
+                # 前向传播
+                with torch.cuda.amp.autocast(enabled=self.config.fp16):
+                    outputs = self.model(input_ids)
+                    
+                    # 计算损失
+                    if hasattr(outputs, 'logits'):
+                        logits = outputs.logits
+                    else:
+                        logits = outputs
+                    
+                    # 简单的语言建模损失
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = input_ids[..., 1:].contiguous()
+                    
+                    loss_fct = nn.CrossEntropyLoss()
+                    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), 
+                                  shift_labels.view(-1))
+                
+                # 记录
+                if step % self.config.logging_steps == 0:
+                    current_mem = torch.cuda.memory_allocated(0) / 1e9 if torch.cuda.is_available() else 0
+                    print(f"步骤 {step}: 损失 {loss.item():.4f}, 显存 {current_mem:.2f}GB")
+                
+                # 清理
+                del input_ids, outputs, logits, loss
+                if step % 10 == 0:  # 每10步清理一次
+                    clear_gpu_memory()
+                
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"❌ 步骤 {step} 显存不足: {e}")
+                print("🔧 尝试减小批大小...")
+                break
+            except Exception as e:
+                print(f"❌ 步骤 {step} 训练错误: {e}")
+                break
+        
+        # 保存最终模型
+        final_model_path = os.path.join(self.config.checkpoint_dir, "final_model.pt")
+        
+        # 如果使用了DataParallel，需要保存module
+        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+        
+        torch.save({
+            'model_state_dict': model_to_save.state_dict(),
+            'config': self.model.config.__dict__ if hasattr(self.model, 'config') else {},
+            'total_params': sum(p.numel() for p in model_to_save.parameters())
+        }, final_model_path)
+        
+        print(f"✅ 模型已保存至: {os.path.abspath(final_model_path)}")
 
 def main():
-    parser = argparse.ArgumentParser(description="显存优化的多GPU训练")
-    parser.add_argument("--config", type=str, default="config_7b_transformer_fixed.yaml", help="配置文件")
-    parser.add_argument("--check_memory", action="store_true", help="只检查显存不训练")
+    parser = argparse.ArgumentParser(description="显存优化的单机多GPU训练脚本")
+    
+    # 配置参数
+    parser.add_argument("--config", type=str, default="config.yaml", help="配置文件路径")
+    parser.add_argument("--model_type", type=str, choices=["transformer", "mamba"], help="模型类型")
+    parser.add_argument("--num_gpus", type=int, help="GPU数量")
+    
+    # 预设配置
+    parser.add_argument("--preset", type=str, help="使用预设配置 (如: 1b_transformer, 7b_mamba)")
+    parser.add_argument("--list_models", action="store_true", help="列出可用模型")
+    parser.add_argument("--list_presets", action="store_true", help="列出可用预设配置")
+    parser.add_argument("--list_datasets", action="store_true", help="列出可用数据集")
+    
+    # 训练参数
+    parser.add_argument("--batch_size", type=int, help="批大小")
+    parser.add_argument("--max_length", type=int, help="最大序列长度")
+    parser.add_argument("--learning_rate", type=float, help="学习率")
+    parser.add_argument("--max_steps", type=int, help="最大训练步数")
+    
+    # 系统参数
+    parser.add_argument("--dry_run", action="store_true", help="只验证配置")
+    parser.add_argument("--no_shutdown", action="store_true", help="禁用自动关机")
+    parser.add_argument("--check_memory", action="store_true", help="检查显存使用")
+    parser.add_argument("--clear_cache", action="store_true", help="清理GPU缓存")
     
     args = parser.parse_args()
     
-    # 检查显存模式
+    # 清理缓存
+    if args.clear_cache:
+        clear_gpu_memory()
+        return
+    
+    # 检查显存
     if args.check_memory:
         if torch.cuda.is_available():
             print("🔍 GPU显存检查:")
+            total_free = 0
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
                 total = props.total_memory / 1e9
                 allocated = torch.cuda.memory_allocated(i) / 1e9
                 reserved = torch.cuda.memory_reserved(i) / 1e9
                 free = total - reserved
+                total_free += free
                 
                 print(f"GPU {i}: {props.name}")
                 print(f"  总显存: {total:.2f}GB")
@@ -201,53 +316,211 @@ def main():
                 print(f"  已保留: {reserved:.2f}GB")
                 print(f"  可用: {free:.2f}GB")
                 
-                if free < 15:  # 7B模型至少需要15GB可用显存
-                    print(f"  ⚠️  显存可能不足（需要约15-20GB）")
+                if free < 10:
+                    print(f"  ⚠️  显存较少")
                 else:
                     print(f"  ✅ 显存充足")
+            
+            print(f"\n总可用显存: {total_free:.2f}GB")
         return
     
-    # 加载配置
-    if not os.path.exists(args.config):
-        print(f"❌ 配置文件不存在: {args.config}")
+    # 列出信息
+    if args.list_models:
+        print("\n🤖 可用模型:")
+        for model_type, desc in list_available_configs().items():
+            print(f"  {model_type}: {desc}")
         return
     
-    with open(args.config, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
+    if args.list_presets:
+        from configs.model_presets import list_model_presets
+        list_model_presets()
+        return
     
-    world_size = config['num_gpus']
+    if args.list_datasets:
+        from data.dataset_manager import DatasetManager
+        manager = DatasetManager()
+        manager.list_datasets()
+        return
     
-    print(f"🚀 启动显存优化训练...")
-    print(f"配置文件: {args.config}")
-    print(f"GPU数量: {world_size}")
-    print(f"批大小: {config['training']['batch_size']}")
-    print(f"梯度累积: {config['training']['gradient_accumulation_steps']}")
-    print(f"混合精度: {config['training']['fp16']}")
+    # 处理预设配置
+    if args.preset:
+        from configs.model_presets import MODEL_PRESETS, get_model_preset, get_training_config_for_model_size
+        
+        if args.preset not in MODEL_PRESETS:
+            print(f"❌ 未知预设配置: {args.preset}")
+            print("可用预设:")
+            for preset_id in MODEL_PRESETS.keys():
+                print(f"  {preset_id}")
+            return
+        
+        preset_config = get_model_preset(args.preset)
+        model_config = preset_config['model']
+        
+        # 生成训练配置
+        training_config = get_training_config_for_model_size(
+            args.preset, 
+            args.num_gpus or 1
+        )
+        
+        print(f"✅ 使用预设配置: {preset_config['description']}")
+        print(f"   参数量: {preset_config['params']}")
+        print(f"   显存需求: {preset_config['memory_estimate']}")
+        
+        # 创建虚拟yaml配置
+        yaml_config = {
+            'model_type': model_config.model_type,
+            'num_gpus': args.num_gpus or 1,
+            'system': {'auto_shutdown': False, 'shutdown_delay': 60}
+        }
+        
+    else:
+        # 加载配置文件
+        if os.path.exists(args.config):
+            yaml_config = load_config(args.config)
+            print(f"✅ 加载配置文件: {args.config}")
+        else:
+            print(f"❌ 配置文件不存在: {args.config}")
+            return
+        
+        # 命令行参数覆盖
+        if args.model_type:
+            yaml_config['model_type'] = args.model_type
+        if args.num_gpus:
+            yaml_config['num_gpus'] = args.num_gpus
+        if args.no_shutdown:
+            yaml_config['system']['auto_shutdown'] = False
+        
+        # 训练参数覆盖
+        if args.batch_size:
+            yaml_config.setdefault('training', {})['batch_size'] = args.batch_size
+        if args.max_length:
+            yaml_config.setdefault('training', {})['max_length'] = args.max_length
+        if args.learning_rate:
+            yaml_config.setdefault('training', {})['learning_rate'] = args.learning_rate
+        if args.max_steps:
+            yaml_config.setdefault('training', {})['max_steps'] = args.max_steps
+        
+        # 创建配置
+        model_config, training_config = create_configs_from_yaml(yaml_config)
     
-    # 清理所有GPU的缓存
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            torch.cuda.set_device(i)
-            torch.cuda.empty_cache()
+    # 计算资源需求
+    total_params = calculate_model_size(model_config)
+    memory_info = estimate_memory_usage(model_config, training_config)
+    
+    # 打印环境信息
+    print(f"\n🌍 运行环境:")
+    print(f"操作系统: {platform.system()}")
+    print(f"Docker容器: {'是' if is_docker_container() else '否'}")
+    print(f"Root用户: {'是' if is_root_user() else '否'}")
+    
+    # 打印配置信息
+    print(f"\n📊 训练配置:")
+    print(f"模型类型: {model_config.model_type}")
+    print(f"参数量: {total_params:,} ({total_params/1e6:.1f}M)")
+    print(f"GPU数量: {yaml_config['num_gpus']}")
+    print(f"批大小: {training_config.train_batch_size}")
+    print(f"估算显存: {memory_info['total_memory_gb']:.1f}GB/GPU")
+    print(f"输出目录: {os.path.abspath(training_config.output_dir)}")
+    print(f"模型保存: {os.path.abspath(training_config.checkpoint_dir)}")
+    
+    # 显示自动关机状态
+    auto_shutdown_enabled = yaml_config.get('system', {}).get('auto_shutdown', False)
+    if auto_shutdown_enabled:
+        shutdown_delay = yaml_config.get('system', {}).get('shutdown_delay', 60)
+        print(f"🔄 自动关机: 启用 ({shutdown_delay}秒延迟)")
+    else:
+        print(f"🔄 自动关机: 禁用")
+    
+    if args.dry_run:
+        print("\n✅ 配置验证完成（dry_run模式）")
+        return
+    
+    # 检查GPU
+    if not torch.cuda.is_available():
+        print("❌ 未检测到CUDA，将使用CPU训练")
+        device_count = 0
+    else:
+        device_count = min(yaml_config['num_gpus'], torch.cuda.device_count())
+        if yaml_config['num_gpus'] > torch.cuda.device_count():
+            print(f"⚠️ 请求{yaml_config['num_gpus']}个GPU，但只有{torch.cuda.device_count()}个可用")
+    
+    print(f"🚀 启动单机{device_count}GPU训练（使用DataParallel）...")
+    
+    # 清理GPU缓存
+    clear_gpu_memory()
     
     try:
-        if world_size <= 1:
-            train_worker_optimized(0, 1, args.config)
-        else:
-            mp.spawn(
-                train_worker_optimized,
-                args=(world_size, args.config),
-                nprocs=world_size,
-                join=True
-            )
+        # 导入模型
+        from models import create_model
+        
+        # 创建模型
+        print("📦 创建模型...")
+        model = create_model(model_config.model_type, model_config)
+        
+        # 移动到主GPU
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device)
+        
+        # 使用DataParallel包装多GPU
+        if device_count > 1:
+            print(f"🔗 使用DataParallel包装{device_count}个GPU...")
+            gpu_ids = list(range(device_count))
+            model = DataParallel(model, device_ids=gpu_ids)
+            
+            # 调整批大小
+            total_batch_size = training_config.train_batch_size * device_count
+            training_config.train_batch_size = training_config.train_batch_size // device_count
+            print(f"📏 调整批大小: 每GPU {training_config.train_batch_size}, 总计 {total_batch_size}")
+        
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"模型参数量: {total_params:,} ({total_params/1e6:.1f}M)")
+        
+        # 创建训练器
+        trainer = OptimizedTrainer(model, training_config, device_count)
+        trainer.train()
+        
         print("✅ 训练完成！")
         
-    except Exception as e:
-        print(f"❌ 训练失败: {e}")
+        # 自动测试训练的模型
+        final_model_path = os.path.join(training_config.checkpoint_dir, "final_model.pt")
+        if os.path.exists(final_model_path):
+            print("\n🧪 开始快速测试训练的模型...")
+            try:
+                import subprocess
+                result = subprocess.run([
+                    sys.executable, 'test_after_training.py', 
+                    '--checkpoint', final_model_path
+                ], capture_output=True, text=True, timeout=120)
+                
+                if result.returncode == 0:
+                    print("✅ 模型快速测试完成")
+                    print("💡 如需完整基准测试，请运行: python test_benchmark.py")
+                else:
+                    print(f"⚠️ 模型测试遇到问题: {result.stderr}")
+            except Exception as e:
+                print(f"⚠️ 无法运行自动测试: {e}")
+                print("💡 可手动运行: python test_after_training.py")
+        
+        # 自动关机功能
+        if auto_shutdown_enabled and not args.no_shutdown:
+            shutdown_delay = yaml_config.get('system', {}).get('shutdown_delay', 60)
+            auto_shutdown(shutdown_delay)
+            
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"❌ 显存不足: {e}")
         print("💡 建议:")
-        print("1. 检查GPU显存: python train_memory_optimized.py --check_memory")
-        print("2. 减小批大小或序列长度")
-        print("3. 清理其他GPU进程")
+        print("1. 减小批大小: --batch_size 2")
+        print("2. 减小序列长度: --max_length 1024")
+        print("3. 清理GPU进程或缓存")
+        print("4. 使用更小的模型预设")
+        
+    except Exception as e:
+        print(f"❌ 训练过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
+        
+    except KeyboardInterrupt:
+        print(f"\n⚠️ 训练被用户中断")
 
 if __name__ == "__main__":
     main() 
