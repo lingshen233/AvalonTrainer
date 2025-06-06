@@ -129,9 +129,9 @@ if torch.cuda.is_available():
 
 # 构建DeepSpeed命令
 if [ -n "$PRESET" ]; then
-    TRAINING_CMD="python train_deepspeed.py --preset $PRESET --num_gpus $NUM_GPUS"
+    TRAINING_CMD="train_deepspeed.py --preset $PRESET --num_gpus $NUM_GPUS"
 else
-    TRAINING_CMD="python train_deepspeed.py --config $CONFIG_FILE --num_gpus $NUM_GPUS"
+    TRAINING_CMD="train_deepspeed.py --config $CONFIG_FILE --num_gpus $NUM_GPUS"
 fi
 
 echo ""
