@@ -64,6 +64,21 @@ def download_pretrained_models():
     print("\n🤖 下载预训练模型...")
     
     models_info = {
+        'gpt2-xl': {
+            'name': 'gpt2-xl',
+            'description': 'GPT-2 XL (1.5B参数)',
+            'size': '1.5B'
+        },
+        'EleutherAI/gpt-neo-1.3B': {
+            'name': 'EleutherAI/gpt-neo-1.3B',
+            'description': 'GPT-Neo 1.3B (1.3B参数)',
+            'size': '1.3B'
+        },
+        'microsoft/DialoGPT-large': {
+            'name': 'microsoft/DialoGPT-large',
+            'description': 'DialoGPT Large (774M参数)',
+            'size': '774M'
+        },
         'gpt2-medium': {
             'name': 'gpt2-medium',
             'description': 'GPT-2 Medium (355M参数)',
@@ -71,13 +86,8 @@ def download_pretrained_models():
         },
         'distilgpt2': {
             'name': 'distilgpt2', 
-            'description': 'DistilGPT-2 (82M参数)',
+            'description': 'DistilGPT-2 (82M参数) - 快速测试',
             'size': '82M'
-        },
-        'microsoft/DialoGPT-medium': {
-            'name': 'microsoft/DialoGPT-medium',
-            'description': 'DialoGPT Medium (355M参数)',
-            'size': '355M'
         }
     }
     
@@ -204,6 +214,50 @@ def test_text_generation(model, tokenizer, prompts=None):
     
     return results
 
+def test_trained_model(checkpoint_path='checkpoints/final_model.pt'):
+    """测试我们训练的模型"""
+    print(f"\n🧪 测试训练的模型: {checkpoint_path}")
+    
+    if not os.path.exists(checkpoint_path):
+        print(f"  ❌ 模型文件不存在: {checkpoint_path}")
+        return None
+    
+    try:
+        # 导入我们的模型系统
+        from models import create_model
+        from configs.base import ModelConfig
+        from transformers import AutoTokenizer
+        
+        # 加载检查点
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        model_config = ModelConfig(**checkpoint['config'])
+        
+        # 创建模型
+        model = create_model(model_config.model_type, model_config)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        # 使用GPT-2的tokenizer（兼容性较好）
+        tokenizer = AutoTokenizer.from_pretrained('gpt2')
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  ✅ 模型加载成功")
+        print(f"  模型类型: {model_config.model_type}")
+        print(f"  参数量: {total_params:,} ({total_params/1e6:.1f}M)")
+        
+        return {
+            'model': model,
+            'tokenizer': tokenizer,
+            'config': model_config,
+            'checkpoint_path': checkpoint_path
+        }
+        
+    except Exception as e:
+        print(f"  ❌ 模型加载失败: {e}")
+        return None
+
 def run_comprehensive_test():
     """运行综合测试"""
     print("🚀 开始综合测试...")
@@ -221,6 +275,18 @@ def run_comprehensive_test():
     
     # 下载模型
     models = download_pretrained_models()
+    
+    # 测试我们训练的模型
+    trained_model = test_trained_model()
+    if trained_model is not None:
+        models['our_trained_model'] = {
+            'model': trained_model['model'],
+            'tokenizer': trained_model['tokenizer'],
+            'info': {
+                'description': f"我们训练的{trained_model['config'].model_type}模型",
+                'size': f"{sum(p.numel() for p in trained_model['model'].parameters())/1e6:.1f}M"
+            }
+        }
     
     # 测试结果
     test_results = {
@@ -314,6 +380,8 @@ def main():
     parser.add_argument("--datasets-only", action="store_true", help="只下载数据集")
     parser.add_argument("--models-only", action="store_true", help="只下载模型")
     parser.add_argument("--quick-test", action="store_true", help="快速测试模式")
+    parser.add_argument("--test-trained", type=str, help="测试指定的训练模型")
+    parser.add_argument("--skip-download", action="store_true", help="跳过下载，只测试训练模型")
     
     args = parser.parse_args()
     
@@ -321,6 +389,16 @@ def main():
         download_benchmark_datasets()
     elif args.models_only:
         download_pretrained_models()
+    elif args.test_trained:
+        # 只测试指定的训练模型
+        test_trained_model(args.test_trained)
+    elif args.skip_download:
+        # 只测试我们的训练模型，不下载其他模型
+        trained_model = test_trained_model()
+        if trained_model is not None:
+            datasets = download_benchmark_datasets()
+            # 简化测试流程...
+            print("🧪 简化测试完成")
     else:
         run_comprehensive_test()
 

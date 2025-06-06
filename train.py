@@ -310,6 +310,26 @@ def main():
         
         print("✅ 训练完成！")
         
+        # 自动测试训练的模型
+        if training_config.output_dir and os.path.exists(os.path.join(training_config.checkpoint_dir, "final_model.pt")):
+            print("\n🧪 开始快速测试训练的模型...")
+            try:
+                # 调用快速测试脚本
+                import subprocess
+                result = subprocess.run([
+                    sys.executable, 'test_after_training.py', 
+                    '--checkpoint', os.path.join(training_config.checkpoint_dir, "final_model.pt")
+                ], capture_output=True, text=True, timeout=120)
+                
+                if result.returncode == 0:
+                    print("✅ 模型快速测试完成")
+                    print("💡 如需完整基准测试，请运行: python test_benchmark.py")
+                else:
+                    print(f"⚠️ 模型测试遇到问题: {result.stderr}")
+            except Exception as e:
+                print(f"⚠️ 无法运行自动测试: {e}")
+                print("💡 可手动运行: python test_after_training.py")
+        
         # 自动关机功能
         if auto_shutdown_enabled and not args.no_shutdown:
             shutdown_delay = yaml_config.get('system', {}).get('shutdown_delay', 60)

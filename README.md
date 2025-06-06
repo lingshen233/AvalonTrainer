@@ -86,6 +86,12 @@ python test_benchmark.py --datasets-only
 
 # 仅下载预训练模型
 python test_benchmark.py --models-only
+
+# 快速测试训练完成的模型
+python test_after_training.py
+
+# 测试指定的模型检查点
+python test_after_training.py --checkpoint checkpoints/best_model.pt
 ```
 
 ## 📊 模型对比
@@ -205,6 +211,7 @@ RAG Transformer/
 ├── test_multi_gpu.py           # GPU测试工具
 ├── quick_test.py               # 快速环境测试
 ├── test_benchmark.py           # 基准测试脚本
+├── test_after_training.py      # 训练后快速测试
 ├── config.yaml                 # 默认配置
 ├── config_transformer_4gpu.yaml # 多GPU示例配置
 ├── requirements.txt            # 依赖包列表
