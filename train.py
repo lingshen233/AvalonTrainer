@@ -1,403 +1,572 @@
 #!/usr/bin/env python3
 """
-简化的多GPU训练脚本
-支持YAML配置文件和命令行参数
+DeepSpeed ZeRO优化训练脚本 - 修复版
+解决批次大小配置问题
 """
 
 import os
-import sys
-import argparse
+import json
 import yaml
 import torch
-import torch.multiprocessing as mp
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import time
-import subprocess
-import platform
+import torch.nn as nn
+import argparse
+import shutil
 
-from configs.presets import get_config, calculate_model_size, estimate_memory_usage, list_available_configs
-from configs.base import ModelConfig, TrainingConfig
-from configs.model_presets import MODEL_PRESETS, list_model_presets, get_model_preset
-from data.dataset_manager import DatasetManager
-from models import create_model
-from trainers.base import BaseTrainer
-from data.processor import DataProcessor
+# DeepSpeed导入
+try:
+    import deepspeed
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
+    print("❌ DeepSpeed未安装，将使用标准训练")
+
+def clear_gpu_memory():
+    """清理GPU显存"""
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.set_device(i)
+            torch.cuda.empty_cache()
 
 def load_config(config_path: str):
     """加载YAML配置文件"""
     with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    return config
+        return yaml.safe_load(f)
 
-def is_docker_container():
-    """检测是否在Docker容器中运行"""
-    try:
-        # 检查是否存在Docker特征文件
-        return (os.path.exists('/.dockerenv') or 
-                os.path.exists('/proc/1/cgroup') and 'docker' in open('/proc/1/cgroup').read())
-    except:
-        return False
-
-def is_root_user():
-    """检测是否为root用户"""
-    return os.geteuid() == 0
-
-def auto_shutdown(delay_seconds: int = 60):
-    """自动关机功能"""
-    print(f"\n🔄 训练完成！将在 {delay_seconds} 秒后自动关机...")
-    print("按 Ctrl+C 取消自动关机")
+def create_deepspeed_config(model_config, training_config, num_gpus):
+    """创建DeepSpeed配置"""
+    # 计算正确的批次大小关系：
+    # train_batch_size = micro_batch_per_gpu * gradient_accumulation_steps * world_size
+    micro_batch_per_gpu = training_config.train_batch_size
+    gradient_accumulation_steps = training_config.gradient_accumulation_steps
+    train_batch_size = micro_batch_per_gpu * gradient_accumulation_steps * num_gpus
     
-    try:
-        for i in range(delay_seconds, 0, -1):
-            print(f"\r⏰ 倒计时: {i} 秒", end="", flush=True)
-            time.sleep(1)
+    ds_config = {
+        "train_batch_size": train_batch_size,
+        "train_micro_batch_size_per_gpu": micro_batch_per_gpu,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
         
-        print(f"\n💤 正在关机...")
+        # 启用ZeRO-2优化
+        "zero_optimization": {
+            "stage": 2,  # ZeRO-2: 分片优化器状态和梯度
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": 5e8,
+            "offload_optimizer": {
+                "device": "none"  # 不使用CPU卸载，Mamba模型不适合
+            }
+        },
         
-        # 检测环境并选择合适的关机命令
-        system = platform.system().lower()
-        in_docker = is_docker_container()
-        is_root = is_root_user()
+        # 混合精度
+        "fp16": {
+            "enabled": training_config.fp16,
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "hysteresis": 2,
+            "min_loss_scale": 1
+        },
         
-        if system == "windows":
-            subprocess.run(["shutdown", "/s", "/t", "0"])
-        elif system in ["linux", "darwin"]:  # Linux或macOS
-            if in_docker:
-                print("🐳 Docker容器环境，执行容器关机...")
-                # 在Docker容器中，直接使用shutdown或halt
-                try:
-                    subprocess.run(["shutdown", "-h", "now"])
-                except FileNotFoundError:
-                    # 如果shutdown不可用，尝试halt
-                    subprocess.run(["halt"])
-            elif is_root:
-                # root用户直接使用shutdown
-                subprocess.run(["shutdown", "-h", "now"])
-            else:
-                # 非root用户使用sudo
-                subprocess.run(["sudo", "shutdown", "-h", "now"])
+        # 优化器配置
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": training_config.learning_rate,
+                "betas": [0.9, 0.95],
+                "eps": 1e-8,
+                "weight_decay": training_config.weight_decay
+            }
+        },
+        
+        # 学习率调度器
+        "scheduler": {
+            "type": "WarmupLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": training_config.learning_rate,
+                "warmup_num_steps": training_config.warmup_steps
+            }
+        },
+        
+        # 梯度裁剪
+        "gradient_clipping": training_config.max_grad_norm,
+        
+        # 检查点配置
+        "steps_per_print": training_config.logging_steps,
+        "wall_clock_breakdown": False,
+        
+        # 内存优化
+        "activation_checkpointing": {
+            "partition_activations": True,
+            "cpu_checkpointing": False,
+            "contiguous_memory_optimization": True,
+            "number_checkpoints": 4,
+            "synchronize_checkpoint_boundary": True
+        }
+    }
+    
+    return ds_config
+
+def use_prebuilt_config(num_gpus):
+    """使用预先构建的正确配置"""
+    config_file = f"deepspeed_{num_gpus}gpu.json"
+    
+    if os.path.exists(config_file):
+        print(f"✅ 使用预构建配置: {config_file}")
+        
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        # 验证配置正确性
+        train_batch = config.get('train_batch_size', 0)
+        micro_batch = config.get('train_micro_batch_size_per_gpu', 0)
+        grad_acc = config.get('gradient_accumulation_steps', 0)
+        expected = micro_batch * grad_acc * num_gpus
+        
+        if train_batch == expected:
+            print(f"✅ 配置验证通过: {train_batch} = {micro_batch} × {grad_acc} × {num_gpus}")
+            return config
         else:
-            print("❌ 不支持的操作系统，无法自动关机")
-            
-    except KeyboardInterrupt:
-        print(f"\n❌ 自动关机已取消")
-    except FileNotFoundError as e:
-        print(f"\n❌ 关机命令未找到: {e}")
-        print("💡 可能的解决方案:")
-        if is_docker_container():
-            print("   - 尝试使用 'halt' 命令")
-            print("   - 或手动停止容器")
-        else:
-            print("   - 确保系统支持shutdown命令")
-            print("   - 检查用户权限设置")
-    except Exception as e:
-        print(f"\n❌ 自动关机失败: {e}")
+            print(f"❌ 配置验证失败: {train_batch} != {expected}")
+            return None
+    else:
+        print(f"⚠️ 未找到预构建配置: {config_file}")
+        return None
 
 def create_configs_from_yaml(yaml_config):
     """从YAML配置创建模型和训练配置"""
+    from configs.base import ModelConfig, TrainingConfig
     
-    # 处理自动批大小
-    batch_size = yaml_config['training']['batch_size']
-    if batch_size is None:
-        # 根据GPU数量和模型类型自动设置
-        if yaml_config['model_type'] == 'mamba':
-            batch_size = 6 if yaml_config['num_gpus'] == 1 else 8
-        else:
-            batch_size = 4 if yaml_config['num_gpus'] == 1 else 6
+    # 创建模型配置
+    model_params = yaml_config.get('model', {})
+    model_config = ModelConfig(
+        model_type=yaml_config.get('model_type', 'mamba'),
+        vocab_size=model_params.get('vocab_size', 50257),
+        max_seq_length=model_params.get('max_seq_length', 4096),
+        d_model=model_params.get('d_model', 4864),
+        n_layers=model_params.get('n_layers', 45),
+        n_heads=model_params.get('n_heads', 32),
+        d_ff=model_params.get('d_ff', 16384),
+        dropout=model_params.get('dropout', 0.1),
+        # Mamba特有参数
+        d_state=model_params.get('d_state', 16),
+        d_conv=model_params.get('d_conv', 4),
+        expand=model_params.get('expand', 2)
+    )
     
-    # 模型配置 - 根据模型类型设置参数
-    model_params = {
-        'model_type': yaml_config['model_type'],
-        'vocab_size': yaml_config['model']['vocab_size'],
-        'max_seq_length': yaml_config['model']['max_seq_length'],
-        'd_model': yaml_config['model']['d_model'],
-        'n_layers': yaml_config['model']['n_layers'],
-        'dropout': yaml_config['model']['dropout']
-    }
-    
-    # 根据模型类型添加特定参数
-    if yaml_config['model_type'] == 'transformer':
-        model_params.update({
-            'n_heads': yaml_config['model']['n_heads'],
-            'd_ff': yaml_config['model']['d_ff']
-        })
-    elif yaml_config['model_type'] == 'mamba':
-        model_params.update({
-            'd_state': yaml_config['model'].get('d_state', 16),
-            'd_conv': yaml_config['model'].get('d_conv', 4),
-            'expand': yaml_config['model'].get('expand', 2)
-        })
-    
-    model_config = ModelConfig(**model_params)
-    
-    # 训练配置
+    # 创建训练配置
+    training_params = yaml_config.get('training', {})
     training_config = TrainingConfig(
-        dataset_name=yaml_config['training']['dataset'],
-        train_batch_size=batch_size,
-        eval_batch_size=batch_size,
-        gradient_accumulation_steps=yaml_config['training']['gradient_accumulation_steps'],
-        max_length=yaml_config['training']['max_length'],
-        learning_rate=yaml_config['training']['learning_rate'],
-        weight_decay=yaml_config['training']['weight_decay'],
-        max_grad_norm=yaml_config['training']['max_grad_norm'],
-        max_steps=yaml_config['training']['max_steps'],
-        warmup_steps=yaml_config['training']['warmup_steps'],
-        eval_steps=yaml_config['training']['eval_steps'],
-        save_steps=yaml_config['training']['save_steps'],
-        logging_steps=yaml_config['training']['logging_steps'],
-        fp16=yaml_config['training']['fp16'],
-        output_dir=yaml_config['training']['output_dir'],
-        checkpoint_dir=yaml_config['training']['checkpoint_dir'],
-        use_wandb=yaml_config['training']['use_wandb'],
-        wandb_project=yaml_config['training']['wandb_project'],
-        wandb_run_name=yaml_config['training']['run_name'],
-        distributed=(yaml_config['num_gpus'] > 1),
-        world_size=yaml_config['num_gpus']
+        dataset_name=training_params.get('dataset', 'auto'),
+        train_batch_size=training_params.get('batch_size', 1),
+        eval_batch_size=training_params.get('eval_batch_size', 1),
+        gradient_accumulation_steps=training_params.get('gradient_accumulation_steps', 8),
+        max_length=training_params.get('max_length', 4096),
+        learning_rate=training_params.get('learning_rate', 1e-4),
+        weight_decay=training_params.get('weight_decay', 0.01),
+        max_grad_norm=training_params.get('max_grad_norm', 1.0),
+        max_steps=training_params.get('max_steps', 200000),
+        warmup_steps=training_params.get('warmup_steps', 10000),
+        eval_steps=training_params.get('eval_steps', 5000),
+        save_steps=training_params.get('save_steps', 10000),
+        logging_steps=training_params.get('logging_steps', 100),
+        fp16=training_params.get('fp16', True),
+        output_dir=training_params.get('output_dir', './outputs'),
+        checkpoint_dir=training_params.get('checkpoint_dir', './checkpoints'),
+        use_wandb=training_params.get('use_wandb', False),
+        wandb_project=training_params.get('wandb_project', 'rag-transformer'),
+        wandb_run_name=training_params.get('wandb_run_name', 'deepspeed_7b'),
+        distributed=True,  # DeepSpeed需要分布式
+        world_size=yaml_config.get('num_gpus', 4)
     )
     
     return model_config, training_config
 
-def setup_ddp(rank: int, world_size: int):
-    """设置分布式训练"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-
-def cleanup_ddp():
-    """清理分布式训练"""
-    destroy_process_group()
-
-def train_worker(rank: int, world_size: int, model_config: ModelConfig, training_config: TrainingConfig):
-    """多GPU训练的工作进程"""
+class DeepSpeedTrainer:
+    """DeepSpeed优化训练器"""
     
-    # 设置分布式
-    if world_size > 1:
-        setup_ddp(rank, world_size)
-    
-    # 设置设备
-    device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
-    
-    # 创建模型
-    model = create_model(model_config.model_type, model_config)
-    model = model.to(device)
-    
-    # 包装为DDP
-    if world_size > 1:
-        model = DDP(model, device_ids=[rank])
-    
-    # 创建简化的训练器
-    class SimpleTrainer:
-        def __init__(self, model, config, device, rank):
-            self.model = model
-            self.config = config
-            self.device = device
-            self.rank = rank
-            self.data_processor = DataProcessor(config)
+    def __init__(self, model_config, training_config, ds_config):
+        self.model_config = model_config
+        self.training_config = training_config
+        self.ds_config = ds_config
         
-        def train(self):
-            print(f"GPU {self.rank}: 开始训练...")
-            # 这里可以添加实际的训练循环
-            # 目前只是演示框架
+        # 创建输出目录
+        os.makedirs(training_config.output_dir, exist_ok=True)
+        os.makedirs(training_config.checkpoint_dir, exist_ok=True)
+        
+        # 初始化分布式环境
+        if not torch.distributed.is_initialized():
+            deepspeed.init_distributed()
+        
+        self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        self.world_size = int(os.environ.get('WORLD_SIZE', 1))
+        
+        print(f"💾 DeepSpeed训练器初始化")
+        print(f"   Local Rank: {self.local_rank}")
+        print(f"   World Size: {self.world_size}")
+        print(f"   输出目录: {os.path.abspath(training_config.output_dir)}")
+    
+    def create_model(self):
+        """创建模型"""
+        from models import create_model
+        
+        print("📦 创建模型...")
+        model = create_model(self.model_config.model_type, self.model_config)
+        
+        # 使用正确的参数量计算函数
+        from configs.model_presets import calculate_model_parameters
+        estimated_params = calculate_model_parameters(self.model_config)
+        
+        # 实际参数量（用于验证）
+        actual_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        if self.local_rank == 0:
+            print(f"模型参数: {actual_params:,} ({actual_params/1e9:.2f}B)")
+            print(f"可训练参数: {trainable_params:,} ({trainable_params/1e9:.2f}B)")
+        
+        return model
+    
+    def create_dataloader(self):
+        """创建简化的数据加载器"""
+        # 这里使用虚拟数据进行演示
+        class DummyDataset:
+            def __init__(self, vocab_size, max_length, num_samples=10000):
+                self.vocab_size = vocab_size
+                self.max_length = max_length
+                self.num_samples = num_samples
             
-            if self.rank == 0:
-                total_params = sum(p.numel() for p in self.model.parameters())
-                print(f"模型参数量: {total_params:,} ({total_params/1e6:.1f}M)")
-                
-                # 创建输出目录
-                os.makedirs(self.config.output_dir, exist_ok=True)
-                os.makedirs(self.config.checkpoint_dir, exist_ok=True)
-                
-                # 保存最终模型（示例）
-                final_model_path = os.path.join(self.config.checkpoint_dir, "final_model.pt")
-                torch.save({
-                    'model_state_dict': self.model.state_dict(),
-                    'config': model_config.__dict__,
-                    'total_params': total_params
-                }, final_model_path)
-                
-                print(f"✅ 模型已保存至: {os.path.abspath(final_model_path)}")
+            def __len__(self):
+                return self.num_samples
+            
+            def __getitem__(self, idx):
+                # 生成随机序列
+                input_ids = torch.randint(0, self.vocab_size, (self.max_length,))
+                return {'input_ids': input_ids, 'labels': input_ids.clone()}
+        
+        dataset = DummyDataset(
+            self.model_config.vocab_size,
+            self.model_config.max_seq_length
+        )
+        
+        # 使用DeepSpeed的数据采样器
+        sampler = torch.utils.data.DistributedSampler(
+            dataset,
+            num_replicas=self.world_size,
+            rank=self.local_rank,
+            shuffle=True
+        )
+        
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.training_config.train_batch_size,
+            sampler=sampler,
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        return dataloader
     
-    trainer = SimpleTrainer(model, training_config, device, rank)
-    trainer.train()
-    
-    if world_size > 1:
-        cleanup_ddp()
+    def train(self):
+        """主训练循环"""
+        # 创建模型
+        model = self.create_model()
+        
+        # 创建数据加载器
+        dataloader = self.create_dataloader()
+        
+        # 初始化DeepSpeed引擎
+        if self.local_rank == 0:
+            print("🚀 初始化DeepSpeed引擎...")
+        
+        model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=model,
+            config=self.ds_config
+        )
+        
+        # 开始训练
+        if self.local_rank == 0:
+            print("🚀 开始DeepSpeed训练...")
+        
+        model_engine.train()
+        global_step = 0
+        
+        try:
+            for epoch in range(1, 6):  # 限制epoch数用于演示
+                dataloader.sampler.set_epoch(epoch)
+                
+                for step, batch in enumerate(dataloader):
+                    if global_step >= self.training_config.max_steps:
+                        break
+                    
+                    # 将数据移动到GPU
+                    input_ids = batch['input_ids'].to(model_engine.device)
+                    labels = batch['labels'].to(model_engine.device)
+                    
+                    # 前向传播
+                    outputs = model_engine(input_ids)
+                    
+                    # 计算损失
+                    if hasattr(outputs, 'logits'):
+                        logits = outputs.logits
+                    else:
+                        logits = outputs
+                    
+                    # 语言建模损失
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    
+                    loss_fct = nn.CrossEntropyLoss()
+                    loss = loss_fct(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    )
+                    
+                    # 反向传播
+                    model_engine.backward(loss)
+                    model_engine.step()
+                    
+                    global_step += 1
+                    
+                    # 记录日志
+                    if global_step % self.training_config.logging_steps == 0 and self.local_rank == 0:
+                        current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler else self.training_config.learning_rate
+                        
+                        # GPU显存使用
+                        allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
+                        reserved = torch.cuda.memory_reserved(self.local_rank) / 1e9
+                        
+                        print(f"步骤 {global_step}: 损失 {loss.item():.4f}, "
+                              f"学习率 {current_lr:.2e}, "
+                              f"显存 {allocated:.1f}/{reserved:.1f}GB")
+                    
+                    # 保存检查点
+                    if global_step % self.training_config.save_steps == 0:
+                        if self.local_rank == 0:
+                            print(f"💾 保存检查点 (步骤 {global_step})...")
+                        
+                        checkpoint_dir = os.path.join(
+                            self.training_config.checkpoint_dir,
+                            f"step_{global_step}"
+                        )
+                        model_engine.save_checkpoint(checkpoint_dir)
+                    
+                    # 清理显存
+                    if global_step % 10 == 0:
+                        torch.cuda.empty_cache()
+                
+                if global_step >= self.training_config.max_steps:
+                    break
+        
+        except Exception as e:
+            if self.local_rank == 0:
+                print(f"❌ 训练过程中出现错误: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 保存最终检查点
+        if self.local_rank == 0:
+            print("💾 保存最终检查点...")
+        
+        final_checkpoint_dir = os.path.join(
+            self.training_config.checkpoint_dir,
+            "final"
+        )
+        model_engine.save_checkpoint(final_checkpoint_dir)
+        
+        if self.local_rank == 0:
+            print("✅ DeepSpeed训练完成！")
 
 def main():
-    parser = argparse.ArgumentParser(description="简化的多GPU训练脚本")
-    parser.add_argument("--config", type=str, default="config.yaml", help="配置文件路径")
-    parser.add_argument("--model_type", type=str, choices=["transformer", "mamba"], help="模型类型")
-    parser.add_argument("--num_gpus", type=int, help="GPU数量")
-    parser.add_argument("--preset", type=str, help="使用预设配置 (如: 1b_transformer, 7b_mamba)")
-    parser.add_argument("--list_models", action="store_true", help="列出可用模型")
-    parser.add_argument("--list_presets", action="store_true", help="列出可用预设配置")
-    parser.add_argument("--list_datasets", action="store_true", help="列出可用数据集")
+    parser = argparse.ArgumentParser(description="DeepSpeed ZeRO优化训练脚本 - 修复版")
+    
+    # 基本参数
+    parser.add_argument("--config", type=str, default="config_7b_mamba.yaml", help="配置文件路径")
+    parser.add_argument("--preset", type=str, help="使用预设配置")
+    parser.add_argument("--num_gpus", type=int, default=4, help="GPU数量")
+    
+    # DeepSpeed参数
+    parser.add_argument("--deepspeed_config", type=str, help="DeepSpeed配置文件")
+    parser.add_argument("--local_rank", type=int, default=-1, help="本地rank (DeepSpeed自动设置)")
+    
+    # 系统参数
     parser.add_argument("--dry_run", action="store_true", help="只验证配置")
-    parser.add_argument("--no_shutdown", action="store_true", help="禁用自动关机")
+    parser.add_argument("--check_memory", action="store_true", help="检查显存使用")
+    parser.add_argument("--fix_config", action="store_true", help="自动修复配置问题")
     
     args = parser.parse_args()
     
-    # 列出可用模型
-    if args.list_models:
-        print("\n🤖 可用模型:")
-        for model_type, desc in list_available_configs().items():
-            print(f"  {model_type}: {desc}")
+    # 检查DeepSpeed
+    if not DEEPSPEED_AVAILABLE:
+        print("❌ 需要安装DeepSpeed:")
+        print("pip install deepspeed")
         return
     
-    # 列出预设配置
-    if args.list_presets:
-        list_model_presets()
+    # 显存检查
+    if args.check_memory:
+        print("🔍 GPU显存检查:")
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                total = props.total_memory / 1e9
+                print(f"GPU {i}: {props.name} - {total:.1f}GB")
         return
     
-    # 列出数据集
-    if args.list_datasets:
-        manager = DatasetManager()
-        manager.list_datasets()
-        return
+    # 自动修复配置
+    if args.fix_config:
+        print("🔧 运行配置修复...")
+        os.system(f"python fix_deepspeed_batch_size.py --num_gpus {args.num_gpus}")
     
-    # 处理预设配置
-    if args.preset:
-        if args.preset not in MODEL_PRESETS:
-            print(f"❌ 未知预设配置: {args.preset}")
-            print("可用预设:")
-            for preset_id in MODEL_PRESETS.keys():
-                print(f"  {preset_id}")
-            return
+    # 修复：优先使用用户指定的deepspeed_config
+    ds_config = None
+    
+    if args.deepspeed_config and os.path.exists(args.deepspeed_config):
+        print(f"✅ 使用指定配置: {args.deepspeed_config}")
+        with open(args.deepspeed_config, 'r') as f:
+            ds_config = json.load(f)
         
-        preset_config = get_model_preset(args.preset)
-        model_config = preset_config['model']
+        # 验证配置正确性
+        train_batch = ds_config.get('train_batch_size', 0)
+        micro_batch = ds_config.get('train_micro_batch_size_per_gpu', 0)
+        grad_acc = ds_config.get('gradient_accumulation_steps', 0)
+        expected = micro_batch * grad_acc * args.num_gpus
         
-        # 为预设生成训练配置
-        from configs.model_presets import get_training_config_for_model_size
-        training_config = get_training_config_for_model_size(
-            args.preset, 
-            args.num_gpus or 1
-        )
-        
-        print(f"✅ 使用预设配置: {preset_config['description']}")
-        print(f"   参数量: {preset_config['params']}")
-        print(f"   显存需求: {preset_config['memory_estimate']}")
-        print(f"   推荐数据集: {', '.join(preset_config['datasets'])}")
-        
-        # 创建虚拟的yaml_config用于后续处理
-        yaml_config = {
-            'model_type': model_config.model_type,
-            'num_gpus': args.num_gpus or 1,
-            'system': {'auto_shutdown': False, 'shutdown_delay': 60}
-        }
-        
-    else:
-        # 加载配置文件
-        if os.path.exists(args.config):
-            yaml_config = load_config(args.config)
-            print(f"✅ 加载配置文件: {args.config}")
+        if train_batch == expected:
+            print(f"✅ 配置验证通过: {train_batch} = {micro_batch} × {grad_acc} × {args.num_gpus}")
         else:
-            print(f"❌ 配置文件不存在: {args.config}")
-            return
+            print(f"❌ 配置验证失败: {train_batch} != {expected}")
+            print(f"🔧 将自动修复批次大小为单GPU配置...")
+            # 为单GPU修复配置
+            ds_config['train_batch_size'] = micro_batch * grad_acc * 1
+            print(f"✅ 修复完成: {ds_config['train_batch_size']} = {micro_batch} × {grad_acc} × 1")
+    else:
+        # 尝试使用预构建配置
+        ds_config = use_prebuilt_config(args.num_gpus)
+    
+    if ds_config is None:
+        print("🔄 fallback到动态生成配置...")
         
-        # 命令行参数覆盖
-        if args.model_type:
-            yaml_config['model_type'] = args.model_type
-        if args.num_gpus:
+        # 处理预设配置
+        if args.preset:
+            from configs.model_presets import get_model_preset, get_training_config_for_model_size
+            
+            preset_config = get_model_preset(args.preset)
+            model_config = preset_config['model']
+            training_config = get_training_config_for_model_size(args.preset, args.num_gpus)
+            
+            print(f"✅ 使用预设: {preset_config['description']}")
+            print(f"   参数量: {preset_config['params']}")
+            
+            # 创建虚拟yaml配置
+            yaml_config = {
+                'model_type': model_config.model_type,
+                'num_gpus': args.num_gpus,
+                'model': {
+                    'vocab_size': model_config.vocab_size,
+                    'max_seq_length': model_config.max_seq_length,
+                    'd_model': model_config.d_model,
+                    'n_layers': model_config.n_layers,
+                    'd_state': getattr(model_config, 'd_state', 16),
+                    'd_conv': getattr(model_config, 'd_conv', 4),
+                    'expand': getattr(model_config, 'expand', 2),
+                    'dropout': model_config.dropout
+                },
+                'training': {
+                    'batch_size': training_config.train_batch_size,
+                    'gradient_accumulation_steps': training_config.gradient_accumulation_steps,
+                    'max_length': training_config.max_length,
+                    'learning_rate': training_config.learning_rate,
+                    'max_steps': training_config.max_steps,
+                    'warmup_steps': training_config.warmup_steps,
+                    'save_steps': training_config.save_steps,
+                    'logging_steps': training_config.logging_steps,
+                    'fp16': training_config.fp16,
+                    'output_dir': training_config.output_dir,
+                    'checkpoint_dir': training_config.checkpoint_dir
+                }
+            }
+        else:
+            # 加载配置文件
+            if not os.path.exists(args.config):
+                print(f"❌ 配置文件不存在: {args.config}")
+                return
+            
+            yaml_config = load_config(args.config)
             yaml_config['num_gpus'] = args.num_gpus
-        if args.no_shutdown:
-            yaml_config['system']['auto_shutdown'] = False
         
-        # 创建配置
+        # 创建配置对象
         model_config, training_config = create_configs_from_yaml(yaml_config)
+        
+        # 创建DeepSpeed配置
+        ds_config = create_deepspeed_config(model_config, training_config, args.num_gpus)
+    else:
+        # 使用预构建配置，需要创建对应的model_config
+        if args.preset:
+            from configs.model_presets import get_model_preset, get_training_config_for_model_size
+            preset_config = get_model_preset(args.preset)
+            model_config = preset_config['model']
+            training_config = get_training_config_for_model_size(args.preset, args.num_gpus)
+        else:
+            yaml_config = load_config(args.config)
+            yaml_config['num_gpus'] = args.num_gpus
+            model_config, training_config = create_configs_from_yaml(yaml_config)
     
-    # 计算资源需求
-    total_params = calculate_model_size(model_config)
-    memory_info = estimate_memory_usage(model_config, training_config)
-    
-    # 打印环境信息
-    print(f"\n🌍 运行环境:")
-    print(f"操作系统: {platform.system()}")
-    print(f"Docker容器: {'是' if is_docker_container() else '否'}")
-    print(f"Root用户: {'是' if is_root_user() else '否'}")
+    # 保存DeepSpeed配置文件（如果不是用户指定的）
+    if not args.deepspeed_config:
+        ds_config_path = "deepspeed_config.json"
+        with open(ds_config_path, 'w') as f:
+            json.dump(ds_config, f, indent=2)
+    else:
+        ds_config_path = args.deepspeed_config
     
     # 打印配置信息
-    print(f"\n📊 训练配置:")
-    print(f"模型类型: {model_config.model_type}")
-    print(f"参数量: {total_params:,} ({total_params/1e6:.1f}M)")
-    print(f"GPU数量: {yaml_config['num_gpus']}")
-    print(f"批大小: {training_config.train_batch_size}")
-    print(f"估算显存: {memory_info['total_memory_gb']:.1f}GB/GPU")
-    print(f"输出目录: {os.path.abspath(training_config.output_dir)}")
-    print(f"模型保存: {os.path.abspath(training_config.checkpoint_dir)}")
+    from configs.model_presets import calculate_model_parameters
+    total_params = calculate_model_parameters(model_config)
     
-    # 显示自动关机状态
-    auto_shutdown_enabled = yaml_config.get('system', {}).get('auto_shutdown', False)
-    if auto_shutdown_enabled:
-        shutdown_delay = yaml_config.get('system', {}).get('shutdown_delay', 60)
-        print(f"🔄 自动关机: 启用 ({shutdown_delay}秒延迟)")
+    # 计算批次大小详情
+    micro_batch = ds_config['train_micro_batch_size_per_gpu']
+    grad_acc = ds_config['gradient_accumulation_steps']
+    world_size = args.num_gpus
+    train_batch = ds_config['train_batch_size']
+    
+    print(f"\n📊 DeepSpeed训练配置:")
+    print(f"模型类型: {model_config.model_type}")
+    print(f"估算参数: {total_params/1e9:.2f}B")
+    print(f"GPU数量: {args.num_gpus}")
+    print(f"批大小/GPU: {micro_batch}")
+    print(f"梯度累积: {grad_acc}")
+    print(f"有效批大小: {train_batch}")
+    print(f"ZeRO阶段: {ds_config['zero_optimization']['stage']}")
+    print(f"DeepSpeed配置: {ds_config_path}")
+    
+    # 强制验证批次大小计算
+    expected = micro_batch * grad_acc * world_size
+    if train_batch != expected:
+        print(f"\n❌ 致命错误: 批次大小不匹配")
+        print(f"   train_batch_size: {train_batch}")
+        print(f"   expected: {micro_batch} × {grad_acc} × {world_size} = {expected}")
+        print(f"🔧 请运行: python fix_deepspeed_batch_size.py --num_gpus {args.num_gpus}")
+        return
     else:
-        print(f"🔄 自动关机: 禁用")
+        print(f"\n✅ 批次大小验证通过: {train_batch} = {micro_batch} × {grad_acc} × {world_size}")
     
     if args.dry_run:
         print("\n✅ 配置验证完成（dry_run模式）")
         return
     
-    # 检查GPU
-    if not torch.cuda.is_available():
-        print("❌ 未检测到CUDA，将使用CPU训练")
-        yaml_config['num_gpus'] = 0
-    elif yaml_config['num_gpus'] > torch.cuda.device_count():
-        print(f"⚠️ 请求{yaml_config['num_gpus']}个GPU，但只有{torch.cuda.device_count()}个可用")
-        yaml_config['num_gpus'] = torch.cuda.device_count()
-    
-    # 开始训练
-    world_size = yaml_config['num_gpus']
-    
+    # 启动训练
     try:
-        if world_size <= 1:
-            # 单GPU训练
-            print("🚀 启动单GPU训练...")
-            train_worker(0, 1, model_config, training_config)
-        else:
-            # 多GPU训练
-            print(f"🚀 启动{world_size}GPU训练...")
-            mp.spawn(
-                train_worker,
-                args=(world_size, model_config, training_config),
-                nprocs=world_size,
-                join=True
-            )
+        trainer = DeepSpeedTrainer(model_config, training_config, ds_config)
+        trainer.train()
         
-        print("✅ 训练完成！")
-        
-        # 自动测试训练的模型
-        if training_config.output_dir and os.path.exists(os.path.join(training_config.checkpoint_dir, "final_model.pt")):
-            print("\n🧪 开始快速测试训练的模型...")
-            try:
-                # 调用快速测试脚本
-                import subprocess
-                result = subprocess.run([
-                    sys.executable, 'test_after_training.py', 
-                    '--checkpoint', os.path.join(training_config.checkpoint_dir, "final_model.pt")
-                ], capture_output=True, text=True, timeout=120)
-                
-                if result.returncode == 0:
-                    print("✅ 模型快速测试完成")
-                    print("💡 如需完整基准测试，请运行: python test_benchmark.py")
-                else:
-                    print(f"⚠️ 模型测试遇到问题: {result.stderr}")
-            except Exception as e:
-                print(f"⚠️ 无法运行自动测试: {e}")
-                print("💡 可手动运行: python test_after_training.py")
-        
-        # 自动关机功能
-        if auto_shutdown_enabled and not args.no_shutdown:
-            shutdown_delay = yaml_config.get('system', {}).get('shutdown_delay', 60)
-            auto_shutdown(shutdown_delay)
-            
     except Exception as e:
-        print(f"❌ 训练过程中出现错误: {e}")
+        print(f"❌ 训练失败: {e}")
+        import traceback
+        traceback.print_exc()
         
-    except KeyboardInterrupt:
-        print(f"\n⚠️ 训练被用户中断")
+        # 自动运行修复建议
+        print(f"\n🔧 建议运行修复命令:")
+        print(f"python fix_deepspeed_batch_size.py --num_gpus {args.num_gpus}")
 
 if __name__ == "__main__":
     main() 

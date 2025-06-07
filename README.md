@@ -1,32 +1,72 @@
-# RAG Transformer - 多GPU训练框架
+# 🚀 RAG Transformer - 大模型训练框架
 
-一个简洁高效的多GPU深度学习训练框架，专注于Transformer和Mamba模型训练。**现支持DeepSpeed ZeRO优化，可在有限显存下训练真正的7B模型！**
+一个专为大规模语言模型训练设计的高效框架，支持Transformer和Mamba架构，集成DeepSpeed ZeRO优化技术。
 
-## 🚀 特性
+## ✨ 核心特性
 
-### 🔥 **NEW: DeepSpeed ZeRO优化**
-- **ZeRO-2分片**: 将7B模型显存需求从87GB降至23GB/GPU
-- **真正7B训练**: 在4张24GB GPU上训练6.89B参数的大模型
-- **智能显存管理**: 参数分片 + 优化器分片 + 梯度重叠
-- **一键启动**: `./launch_deepspeed.sh --num_gpus 4 --preset 7b_mamba`
+### 🎯 模型架构支持
+- **Transformer**: 经典注意力机制，支持7B参数规模
+- **Mamba**: 状态空间模型，内存效率更高，训练速度更快
 
-### 🎯 **核心功能**
-- **双模型支持**: Transformer和Mamba状态空间模型
-- **多训练模式**: DataParallel + DeepSpeed ZeRO + 单机多卡
-- **智能批大小**: 自动根据GPU数量和模型类型优化批大小
-- **YAML配置**: 简单直观的配置文件系统
-- **显存优化**: 自动估算显存需求，避免OOM错误
-- **即开即用**: 预配置的训练脚本，快速上手
-- **自动关机**: 训练完成后可自动关机（可选）
+### ⚡ 训练优化
+- **DeepSpeed ZeRO**: 支持ZeRO-1/2/3优化策略
+- **混合精度**: FP16训练，显著降低显存占用
+- **梯度累积**: 支持大批次训练
+- **激活检查点**: 进一步节省显存
 
-## 📋 环境要求
+### 🔧 硬件适配
+- **多GPU支持**: 1-8卡分布式训练
+- **A800优化**: 专门针对80GB显存优化
+- **内存管理**: 智能显存清理和批次大小调整
 
-- Python 3.8+
-- CUDA 11.0+
-- PyTorch 2.0+
-- 支持的GPU: RTX 3090/4090, A100等
+### 🛠️ 开发工具
+- **诊断工具**: 自动检测硬件配置和内存使用
+- **修复工具**: 自动修复配置错误
+- **预设配置**: 开箱即用的模型配置
 
-## 🛠️ 安装
+## 📁 项目结构
+
+```
+RAG Transformer/
+├── 🐍 train.py                     # 主训练脚本 (DeepSpeed优化)
+├── 📄 README.md                    # 项目文档
+├── 📄 requirements.txt              # 依赖包列表
+├── 📄 .gitignore                   # Git忽略文件
+│
+├── 📁 configs/                     # 配置文件
+│   ├── 📁 deepspeed/              # DeepSpeed配置 (11个预设)
+│   │   ├── deepspeed_1gpu.json    # 单卡配置
+│   │   ├── deepspeed_single_a800_80g.json  # A800专用
+│   │   └── deepspeed_*gpu.json    # 多卡配置
+│   ├── 🐍 *.py                    # Python配置模块
+│   └── 📄 *.yaml                  # 模型配置文件
+│
+├── 📁 scripts/                     # 脚本工具
+│   ├── 📁 launch/                 # 启动脚本
+│   │   ├── launch_single_a800_80g.sh    # A800启动脚本
+│   │   └── launch_*gpu*.sh        # 多GPU启动脚本
+│   └── 📄 install_*.sh            # 安装脚本
+│
+├── 📁 tools/                       # 工具集
+│   ├── 📁 diagnostic/             # 诊断工具
+│   │   ├── diagnose_a800_80g.py   # A800诊断
+│   │   ├── gpu_tflop_calculator.py # 性能计算
+│   │   └── memory_calculator.py   # 内存估算
+│   ├── 📁 fixes/                  # 修复工具
+│   │   ├── fix_deepspeed_batch_size.py  # 批次修复
+│   │   └── fix_dtype_mismatch.py  # 数据类型修复
+│   └── 🐍 list_datasets.py        # 数据集工具
+│
+├── 📁 tests/                       # 测试文件
+├── 📁 models/                      # 模型定义
+├── 📁 utils/                       # 工具函数
+├── 📁 trainers/                    # 训练器
+└── 📁 data/                        # 数据处理
+```
+
+## 🚀 快速开始
+
+### 1. 环境安装
 
 ```bash
 # 克隆项目
@@ -35,479 +75,162 @@ cd "RAG Transformer"
 
 # 安装依赖
 pip install -r requirements.txt
+
+# 安装DeepSpeed (推荐)
+bash scripts/install_deepspeed.sh
 ```
 
-## 🎯 快速开始
+### 2. 硬件检测
 
-### 1. 环境检查
 ```bash
-# 快速验证环境和依赖
-python quick_test.py
+# 检测GPU配置
+python tools/diagnostic/diagnose_a800_80g.py
+
+# 计算模型内存需求
+python tools/diagnostic/memory_calculator.py
 ```
 
-### 2. 查看可用配置
+### 3. 开始训练
+
+#### 🎯 A800单卡训练 (推荐)
 ```bash
-# 查看预设模型配置
-python train.py --list_presets
+# 使用A800专用配置
+deepspeed --num_gpus=1 train.py \
+    --preset 7b_mamba \
+    --deepspeed_config configs/deepspeed/deepspeed_single_a800_80g.json
 
-# 查看可用数据集
-python train.py --list_datasets
-
-# 查看可用模型
-python train.py --list_models
+# 或使用启动脚本
+bash scripts/launch/launch_single_a800_80g.sh
 ```
 
-### 3. 选择训练规模
-
-**标准训练模式：**
+#### 🔥 多GPU训练
 ```bash
-# 1B模型训练 (适合单卡RTX 4090)
-python train.py --preset 1b_transformer
+# 4卡训练
+deepspeed --num_gpus=4 train.py \
+    --preset 7b_mamba \
+    --deepspeed_config configs/deepspeed/deepspeed_4gpu.json
 
-# 7B模型训练 (需要4卡以上)
-python train.py --preset 7b_transformer --num_gpus 4
-
-# Mamba模型 (显存效率更高)
-python train.py --preset 1b_mamba
+# 6卡极限优化
+bash scripts/launch/launch_6gpu_extreme_safe.sh
 ```
 
-**🔥 DeepSpeed ZeRO优化训练（推荐大模型）：**
+#### ⚙️ 自定义配置
 ```bash
-# 安装DeepSpeed
-./install_deepspeed.sh
-
-# 真正7B模型训练 (4张24GB GPU)
-./launch_deepspeed.sh --num_gpus 4 --preset 7b_mamba
-
-# 推荐配置 (6张24GB GPU，更安全)
-./launch_deepspeed.sh --num_gpus 6 --preset 7b_mamba
-
-# 诚实3B模型 (如果7B太大)
-./launch_deepspeed.sh --num_gpus 4 --preset 3b_mamba
-
-# 检查显存需求
-python memory_calculator.py
+# 使用YAML配置文件
+python train.py --config configs/config_7b_mamba.yaml --num_gpus 1
 ```
 
-### 4. 数据集管理
+## 📊 模型配置
+
+### 🦣 Mamba模型 (推荐)
+- **7B参数**: `7b_mamba` - 生产级配置
+- **3B轻量**: `3b_mamba_lite` - 内存友好版本
+
+### 🤖 Transformer模型
+- **7B参数**: 经典Transformer架构
+- **1B-4B**: 多种规模可选
+
+## 🔧 故障排除
+
+### 常见问题
+
+#### 1. 批次大小错误
 ```bash
-# 浏览所有可用数据集
-python list_datasets.py
+# 自动修复
+python tools/fixes/fix_deepspeed_batch_size.py --num_gpus 1
 
-# 查看1B模型推荐数据集
-python list_datasets.py --recommend 1B
-
-# 查看7B模型推荐数据集
-python list_datasets.py --recommend 7B
-
-# 下载指定数据集
-python list_datasets.py --download wikitext
+# 手动检查
+python train.py --dry_run --preset 7b_mamba
 ```
 
-### 5. 测试GPU设置
+#### 2. 显存不足
 ```bash
-python test_multi_gpu.py
+# 诊断内存使用
+python tools/diagnostic/diagnose_7b_memory.py
+
+# 使用轻量配置
+python train.py --preset 3b_mamba_lite
 ```
 
-### 6. 验证配置
+#### 3. 数据类型错误
 ```bash
-python train.py --dry_run
+# 修复FP16不匹配
+python tools/fixes/fix_dtype_mismatch.py
 ```
 
-### 7. 开始训练
+### 🆘 紧急修复
 
-**单GPU训练（默认）：**
+如果遇到配置问题，运行诊断工具：
 ```bash
-python train.py
-```
+# 全面诊断
+python tools/diagnostic/diagnose_a800_80g.py --verbose
 
-**多GPU训练：**
-```bash
-python train.py --config config_transformer_4gpu.yaml --num_gpus 4
-```
-
-**命令行覆盖配置：**
-```bash
-python train.py --model_type transformer --num_gpus 2
-```
-
-**启用自动关机训练：**
-```bash
-# 修改config.yaml中 system.auto_shutdown: true
-python train.py
-```
-
-### 8. 基准测试
-```bash
-# 下载标准数据集和预训练模型进行测试
-python test_benchmark.py
-
-# 仅下载数据集
-python test_benchmark.py --datasets-only
-
-# 仅下载预训练模型
-python test_benchmark.py --models-only
-
-# 快速测试训练完成的模型
-python test_after_training.py
-
-# 测试指定的模型检查点
-python test_after_training.py --checkpoint checkpoints/best_model.pt
-```
-
-## 📊 模型对比
-
-### 标准训练模式（DataParallel）
-| 预设配置 | 模型类型 | 参数量 | 显存需求 | 推荐GPU | 适用场景 |
-|----------|----------|--------|----------|---------|----------|
-| **1b_transformer** | Transformer | 1.0B | 12GB/GPU | RTX 4090×1 | 通用语言建模 |
-| **1b_mamba** | Mamba | 1.0B | 9GB/GPU | RTX 3090×1 | 高效长序列处理 |
-| **test_small** | Transformer | 50M | 2GB/GPU | 任意GPU | 快速测试验证 |
-
-### 🔥 DeepSpeed ZeRO-2优化模式
-| 预设配置 | 模型类型 | 参数量 | 显存需求 | 推荐GPU | 突破意义 |
-|----------|----------|--------|----------|---------|----------|
-| **7b_mamba** | Mamba | **6.89B** | 23.1GB/GPU | RTX 4090×4 | 🎯 **真正7B大模型** |
-| **7b_mamba** | Mamba | 6.89B | 16.1GB/GPU | RTX 4090×6 | ✅ **安全训练** |
-| **7b_mamba** | Mamba | 6.89B | 12.6GB/GPU | RTX 4090×8 | 🚀 **最佳性能** |
-| **3b_mamba** | Mamba | 2.84B | 15GB/GPU | RTX 4090×4 | 📚 **诚实3B** |
-
-### 显存效率对比
-| 训练方式 | 7B模型显存 | GPU数量 | 总显存需求 | 可行性 |
-|----------|-----------|---------|------------|--------|
-| DataParallel | 87.5GB/GPU | 4 | 350GB | ❌ 不可行 |
-| **DeepSpeed ZeRO-2** | **23.1GB/GPU** | **4** | **92.4GB** | ✅ **可行** |
-
-## ⚙️ 配置文件
-
-### 默认配置 (config.yaml)
-```yaml
-# 基础设置
-model_type: "mamba"  # transformer 或 mamba
-num_gpus: 1          # GPU数量
-
-# 模型配置
-model:
-  d_model: 1536      # 模型维度
-  n_layers: 24       # 层数
-  dropout: 0.1
-
-# 训练配置
-training:
-  batch_size: null   # null=自动计算
-  max_steps: 50000
-  learning_rate: 3e-4
-  fp16: true
-  output_dir: "./outputs"
-  checkpoint_dir: "./checkpoints"
-
-# 系统配置
-system:
-  auto_shutdown: false  # 训练完成后自动关机
-  shutdown_delay: 60    # 关机前等待时间（秒）
-```
-
-### 多GPU配置示例
-```yaml
-model_type: "transformer"
-num_gpus: 4
-
-model:
-  d_model: 1536
-  n_layers: 24
-
-training:
-  batch_size: 8      # 每个GPU的批大小
-  gradient_accumulation_steps: 2
-
-system:
-  auto_shutdown: true  # 长时间训练后自动关机
-  shutdown_delay: 60
-```
-
-## 💾 模型文件保存
-
-### 保存位置
-训练完成后，模型文件将自动保存到：
-
-```
-RAG Transformer/
-├── checkpoints/           # 主要模型文件
-│   ├── final_model.pt    # 最终训练完成的模型
-│   ├── best_model.pt     # 验证集上表现最好的模型
-│   └── checkpoint_step_*.pt  # 定期检查点
-└── outputs/              # 日志和输出文件
-```
-
-### 模型文件说明
-
-1. **final_model.pt**: 训练完成时的最终模型状态
-2. **best_model.pt**: 验证集上损失最低的模型（推荐使用）
-3. **checkpoint_step_*.pt**: 每5000步保存的检查点（用于断点续训）
-
-详细说明请参考：[MODEL_FILES.md](MODEL_FILES.md)
-
-### 加载模型
-```python
-import torch
-from models import create_model
-from configs.base import ModelConfig
-
-# 加载最终模型
-checkpoint = torch.load('checkpoints/final_model.pt')
-model_config = ModelConfig(**checkpoint['config'])
-model = create_model(model_config.model_type, model_config)
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
-```
-
-## 🔧 配置选项
-
-### 模型类型
-- **transformer**: 标准Transformer架构，通用性好
-- **mamba**: 高效Mamba状态空间模型，显存占用更少
-
-### GPU配置
-- `num_gpus: 1`: 单GPU训练
-- `num_gpus: 2-8`: 多GPU并行训练
-
-### 批大小策略
-- `batch_size: null`: 自动优化（推荐）
-- `batch_size: 8`: 手动指定
-
-### 自动关机
-- `auto_shutdown: false`: 禁用自动关机（默认）
-- `auto_shutdown: true`: 训练完成后自动关机
-- `shutdown_delay: 60`: 关机前等待时间
-
-## 📁 项目结构
-
-```
-RAG Transformer/
-├── train.py                    # 主训练脚本
-├── test_multi_gpu.py           # GPU测试工具
-├── quick_test.py               # 快速环境测试
-├── test_benchmark.py           # 基准测试脚本
-├── test_after_training.py      # 训练后快速测试
-├── list_datasets.py            # 数据集浏览工具
-├── config.yaml                 # 默认配置
-├── config_transformer_4gpu.yaml # 多GPU示例配置
-├── config_1b_transformer.yaml  # 1B模型配置
-├── config_7b_transformer.yaml  # 7B模型配置
-├── requirements.txt            # 依赖包列表
-├── configs/                    # 配置系统
-│   ├── base.py                 # 基础配置类
-│   ├── presets.py              # 预设配置
-│   ├── model_presets.py        # 模型规模预设
-│   └── registry.py             # 配置注册
-├── models/                     # 模型实现
-│   ├── transformer.py          # Transformer模型
-│   ├── mamba.py                # Mamba模型
-│   └── registry.py             # 模型注册
-├── trainers/                   # 训练器
-│   ├── base.py                 # 基础训练器
-│   └── multi_gpu.py            # 多GPU训练器
-├── data/                       # 数据处理
-│   ├── processor.py            # 数据处理器
-│   └── dataset_manager.py      # 数据集管理器
-├── utils/                      # 工具函数
-│   └── logging.py              # 日志工具
-├── test_results/               # 测试结果目录（自动创建）
-└── data_cache/                 # 数据集缓存目录（自动创建）
+# 检查GPU状态
+python tools/diagnostic/check_gpu_memory.py
 ```
 
 ## 📈 性能优化
 
-### 自动优化
-- 根据GPU数量自动调整批大小
-- 智能梯度累积设置
-- 混合精度训练（FP16）
+### 🎯 A800-80GB优化建议
+- **批次大小**: 4-8 (根据序列长度调整)
+- **梯度累积**: 4-8步
+- **ZeRO阶段**: ZeRO-2 (平衡性能和内存)
+- **激活检查点**: 4个检查点
 
-### 显存管理
-- 训练前显存需求估算
-- 自动批大小计算
-- OOM错误预防
+### 🔥 多GPU优化
+- **6×32GB**: 使用极限内存优化配置
+- **4×40GB**: 标准ZeRO-2配置
+- **8×80GB**: 可使用ZeRO-1获得最佳性能
 
-### 多GPU加速
-- PyTorch DistributedDataParallel (DDP)
-- 自动设备分配
-- 高效进程间通信
+## 🛡️ 最佳实践
 
-## ⚡ 自动关机功能
-
-### 启用方式
-1. 修改 `config.yaml`：
-   ```yaml
-   system:
-     auto_shutdown: true
-     shutdown_delay: 60
-   ```
-
-2. 或使用命令行：
-   ```bash
-   python train.py --no_shutdown  # 禁用自动关机
-   ```
-
-### 训练完成流程
-1. ✅ 训练完成
-2. 💾 自动保存模型到 `checkpoints/final_model.pt`
-3. 📊 显示完整的模型保存路径
-4. ⏰ 开始倒计时（默认60秒）
-5. 💤 执行关机命令
-
-### 取消关机
-- **按 Ctrl+C**: 在倒计时期间取消自动关机
-- **命令行**: 使用 `--no_shutdown` 参数
-
-## 🛠️ 故障排除
-
-### 显存不足
-```yaml
-training:
-  batch_size: 2                    # 减少批大小
-  gradient_accumulation_steps: 16  # 增加梯度累积
-```
-
-### 多GPU问题
-- 确保所有GPU型号一致
-- 检查CUDA和NCCL版本
-- 验证GPU间通信带宽
-
-### 训练速度慢
-- 使用更大的批大小
-- 启用FP16混合精度
-- 优化数据加载器worker数量
-
-### 自动关机失败
-- **Windows**: 确保运行在管理员权限
-- **Linux/macOS**: 确保sudo权限或配置免密sudo
-
-## 📊 使用示例
-
-### 适合3090单卡的配置
+### 1. 训练前检查
 ```bash
-# Mamba模型，显存友好
-python train.py --model_type mamba
+# 验证配置
+python train.py --dry_run --check_memory
+
+# 清理GPU缓存
+bash scripts/clear_gpu_processes.sh
 ```
 
-### 适合4090多卡的配置  
-```bash
-# Transformer模型，4GPU并行，训练完成后自动关机
-python train.py --config config_transformer_4gpu.yaml
-```
+### 2. 监控训练
+- 使用 `--use_wandb` 启用WandB监控
+- 定期检查显存使用情况
+- 设置合理的保存间隔
 
-### 自定义大模型训练
-```yaml
-model_type: "transformer"
-num_gpus: 8
+### 3. 错误恢复
+- 启用自动检查点保存
+- 使用 `--resume_from_checkpoint` 恢复训练
+- 定期备份重要检查点
 
-model:
-  d_model: 2048
-  n_layers: 32
-
-training:
-  batch_size: 4
-  gradient_accumulation_steps: 8
-  max_steps: 100000
-
-system:
-  auto_shutdown: true
-  shutdown_delay: 120  # 2分钟倒计时
-```
-
-## 🚀 命令行参数
-
-```bash
-python train.py [OPTIONS]
-
-选项:
-  --config PATH          配置文件路径 (默认: config.yaml)
-  --model_type TEXT      模型类型 (transformer/mamba)
-  --num_gpus INTEGER     GPU数量
-  --list_models          列出可用模型
-  --dry_run              验证配置但不训练
-  --no_shutdown          禁用自动关机
-  --help                 显示帮助信息
-```
-
-## 🔍 GPU测试工具
-
-```bash
-# 全面测试GPU设置和配置
-python test_multi_gpu.py
-
-# 只检查GPU信息
-python test_multi_gpu.py --skip_config
-```
-
-输出示例：
-```
-🚀 RAG Transformer 多GPU训练测试
-==================================================
-🔍 GPU信息检测:
-CUDA可用: True
-GPU数量: 4
-  GPU 0: NVIDIA GeForce RTX 4090 (24.0GB)
-  GPU 1: NVIDIA GeForce RTX 4090 (24.0GB)
-  GPU 2: NVIDIA GeForce RTX 4090 (24.0GB)
-  GPU 3: NVIDIA GeForce RTX 4090 (24.0GB)
-
-💡 使用建议:
-- 可以使用4GPU并行训练
-- 修改配置文件中的 num_gpus 参数
-- 批大小会自动调整以适应多GPU
-```
-
-## 📝 开发指南
-
-### 添加新模型
-1. 在 `models/` 目录下实现模型类
-2. 在 `models/registry.py` 中注册模型
-3. 更新配置系统支持新模型参数
-
-### 自定义训练逻辑
-1. 继承 `trainers/base.py` 中的 `BaseTrainer`
-2. 重写 `train_step()` 和 `evaluate()` 方法
-3. 在训练脚本中使用自定义训练器
-
-## 🤝 贡献
+## 🤝 贡献指南
 
 欢迎提交Issue和Pull Request！
 
-## 📚 相关文档
-
-- **[DeepSpeed ZeRO训练指南](README_DEEPSPEED.md)** - 详细的7B模型训练教程
-- **[显存需求计算器](memory_calculator.py)** - 精确估算不同配置的显存需求
-- **[模型预设配置](configs/model_presets.py)** - 所有可用的模型配置
-- **[安装脚本说明](install_deepspeed.sh)** - DeepSpeed自动安装
-
-### 脚本快速参考
+### 开发环境
 ```bash
-# DeepSpeed相关
-./install_deepspeed.sh          # 安装DeepSpeed
-./launch_deepspeed.sh --help    # 查看DeepSpeed训练选项
-python memory_calculator.py     # 计算显存需求
+# 安装开发依赖
+pip install -r requirements.txt
 
-# 标准训练
-python train.py --list_presets  # 查看所有预设
-python train_memory_optimized.py # 单机多卡优化版
+# 运行测试
+python -m pytest tests/
+
+# 代码格式化
+black . && isort .
 ```
 
-## 📈 最新更新
+## 📄 许可证
 
-### v2.0 - DeepSpeed ZeRO优化
-- ✅ **ZeRO-2分片**: 将7B模型显存从87GB降至23GB/GPU
-- ✅ **真正7B训练**: 支持6.89B参数的大模型训练  
-- ✅ **一键启动**: 简化的启动脚本和配置
-- ✅ **智能显存管理**: 自动分片和优化
-- ✅ **诚实标注**: 不再有"参数量欺骗"
+MIT License - 详见 [LICENSE](LICENSE) 文件
 
-### v1.0 - 基础框架
-- ✅ Transformer和Mamba模型支持
-- ✅ 多GPU DataParallel训练
-- ✅ YAML配置系统
-- ✅ 自动关机功能
+## 🙏 致谢
 
-## �� 许可证
+- [DeepSpeed](https://github.com/microsoft/DeepSpeed) - 分布式训练优化
+- [Mamba](https://github.com/state-spaces/mamba) - 状态空间模型
+- [Transformers](https://github.com/huggingface/transformers) - 模型架构参考
 
-MIT License 
+---
+
+**🚀 开始你的大模型训练之旅！**
+
+如有问题，请查看 [故障排除](#-故障排除) 部分或提交Issue。 
